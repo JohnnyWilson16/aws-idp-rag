@@ -33,7 +33,7 @@ Globals:
     MemorySize: 1024
     Runtime: python3.11
     Architectures:
-      - x86_64
+      - arm64
     Tracing: Active
     Environment:
       Variables:
@@ -241,6 +241,9 @@ Resources:
       FunctionName: !Sub "idp-pipeline-processor-${Environment}"
       CodeUri: src/idp_pipeline/
       Handler: handler.lambda_handler
+      Runtime: python3.11
+      Architectures:
+        - arm64
       Timeout: 300
       MemorySize: 1024
       Role: !GetAtt IdpPipelineLambdaRole.Arn
@@ -251,6 +254,9 @@ Resources:
       FunctionName: !Sub "rag-query-api-${Environment}"
       CodeUri: src/query_api/
       Handler: app.lambda_handler
+      Runtime: python3.11
+      Architectures:
+        - arm64
       Timeout: 60
       MemorySize: 1024
       Role: !GetAtt QueryApiLambdaRole.Arn
@@ -268,6 +274,9 @@ Resources:
       FunctionName: !Sub "rag-document-api-${Environment}"
       CodeUri: src/document_api/
       Handler: app.lambda_handler
+      Runtime: python3.11
+      Architectures:
+        - arm64
       Timeout: 30
       MemorySize: 256
       Role: !GetAtt DocumentApiLambdaRole.Arn
