@@ -264,7 +264,7 @@ Resources:
         QueryHttpEvent:
           Type: HttpApi
           Properties:
-            ApiId: !Ref ServerlessHttpApi
+            ApiId: !Ref HttpApiGateway
             Path: /query
             Method: POST
 
@@ -284,26 +284,26 @@ Resources:
         ListDocumentsEvent:
           Type: HttpApi
           Properties:
-            ApiId: !Ref ServerlessHttpApi
+            ApiId: !Ref HttpApiGateway
             Path: /documents
             Method: GET
         GetDocumentEvent:
           Type: HttpApi
           Properties:
-            ApiId: !Ref ServerlessHttpApi
+            ApiId: !Ref HttpApiGateway
             Path: /documents/{document_id}
             Method: GET
         UploadUrlEvent:
           Type: HttpApi
           Properties:
-            ApiId: !Ref ServerlessHttpApi
+            ApiId: !Ref HttpApiGateway
             Path: /upload-url
             Method: POST
 
   ##############################################################################
   # 4. API GATEWAY (HTTP API)
   ##############################################################################
-  ServerlessHttpApi:
+  HttpApiGateway:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: !Ref Environment
@@ -435,7 +435,7 @@ Resources:
 Outputs:
   ApiEndpoint:
     Description: HTTP API Gateway base URL
-    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Value: !Sub "https://${HttpApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
 
   DocumentStorageBucketName:
     Description: S3 Storage Bucket Name
