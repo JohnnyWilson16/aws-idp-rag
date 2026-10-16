@@ -1,0 +1,441 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS Serverless IDP + RAG Pipeline (Zero Bedrock, Free-Tier Optimized)
+  Documents -> OCR (Textract Async) -> S3 -> Step Functions -> FAISS Index -> Query API -> Hugging Face LLM
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment stage environment name.
+
+  HuggingFaceToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: (Optional) Hugging Face API Token for higher rate limits on Inference API.
+
+  DefaultLLMModel:
+    Type: String
+    Default: meta-llama/Llama-3.2-3B-Instruct
+    Description: Open-source LLM hosted on Hugging Face Serverless API.
+
+  EmbeddingModelId:
+    Type: String
+    Default: sentence-transformers/all-MiniLM-L6-v2
+    Description: 384-dimensional embedding model ID.
+
+Globals:
+  Function:
+    Timeout: 120
+    MemorySize: 1024
+    Runtime: python3.11
+    Architectures:
+      - x86_64
+    Tracing: Active
+    Environment:
+      Variables:
+        ENV: !Ref Environment
+        DYNAMODB_TABLE_NAME: !Ref DocumentMetadataTable
+        DOCUMENT_BUCKET_NAME: !Ref DocumentStorageBucket
+        HF_TOKEN: !Ref HuggingFaceToken
+        LLM_MODEL_ID: !Ref DefaultLLMModel
+        EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,OPTIONS'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+      AllowOrigin: "'*'"
+
+Resources:
+  ##############################################################################
+  # 1. STORAGE: Amazon S3 & DynamoDB
+  ##############################################################################
+  DocumentStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "aws-idp-rag-storage-${AWS::AccountId}-${AWS::Region}-${Environment}"
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['GET', 'PUT', 'POST', 'HEAD']
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DocumentMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "DocumentMetadata-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: DocumentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: DocumentId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: false
+      Tags:
+        - Key: Project
+          Value: AWS-IDP-RAG
+
+  ##############################################################################
+  # 2. IAM ROLES (Least Privilege)
+  ##############################################################################
+  IdpPipelineLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "IdpPipelineLambdaRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IdpPipelineLeastPrivilegePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DocumentStorageBucket.Arn
+                  - !Sub "${DocumentStorageBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource: !GetAtt DocumentMetadataTable.Arn
+              - Effect: Allow
+                Action:
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentTextDetection
+                  - textract:DetectDocumentText
+                Resource: "*"
+
+  QueryApiLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "QueryApiLambdaRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QueryApiLeastPrivilegePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DocumentStorageBucket.Arn
+                  - !Sub "${DocumentStorageBucket.Arn}/*"
+
+  DocumentApiLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "DocumentApiLambdaRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DocumentApiLeastPrivilegePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt DocumentMetadataTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${DocumentStorageBucket.Arn}/uploads/*"
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "StepFunctionsExecutionRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsInvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt IdpPipelineFunction.Arn
+
+  EventBridgeToStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "EventBridgeToStepFunctionsRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref DocumentProcessingStateMachine
+
+  ##############################################################################
+  # 3. LAMBDA FUNCTIONS
+  ##############################################################################
+  IdpPipelineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "idp-pipeline-processor-${Environment}"
+      CodeUri: src/idp_pipeline/
+      Handler: handler.lambda_handler
+      Timeout: 300
+      MemorySize: 1024
+      Role: !GetAtt IdpPipelineLambdaRole.Arn
+
+  QueryApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "rag-query-api-${Environment}"
+      CodeUri: src/query_api/
+      Handler: app.lambda_handler
+      Timeout: 60
+      MemorySize: 1024
+      Role: !GetAtt QueryApiLambdaRole.Arn
+      Events:
+        QueryHttpEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ServerlessHttpApi
+            Path: /query
+            Method: POST
+
+  DocumentApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "rag-document-api-${Environment}"
+      CodeUri: src/document_api/
+      Handler: app.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt DocumentApiLambdaRole.Arn
+      Events:
+        ListDocumentsEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ServerlessHttpApi
+            Path: /documents
+            Method: GET
+        GetDocumentEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ServerlessHttpApi
+            Path: /documents/{document_id}
+            Method: GET
+        UploadUrlEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ServerlessHttpApi
+            Path: /upload-url
+            Method: POST
+
+  ##############################################################################
+  # 4. API GATEWAY (HTTP API)
+  ##############################################################################
+  ServerlessHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Amz-Date
+          - X-Api-Key
+        AllowOrigins:
+          - "*"
+        MaxAge: 3600
+
+  ##############################################################################
+  # 5. AWS STEP FUNCTIONS STATE MACHINE
+  ##############################################################################
+  DocumentProcessingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "DocumentProcessingPipeline-${Environment}"
+      Role: !GetAtt StepFunctionsExecutionRole.Arn
+      Type: STANDARD
+      Definition:
+        Comment: Orchestrates Async Textract OCR, Extraction, Chunking, Embeddings, and FAISS Indexing
+        StartAt: StartProcessing
+        States:
+          StartProcessing:
+            Type: Task
+            Resource: !GetAtt IdpPipelineFunction.Arn
+            Parameters:
+              action: start
+              s3_bucket.$: "$.detail.bucket.name"
+              s3_key.$: "$.detail.object.key"
+            ResultPath: "$"
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: HandleFailure
+                ResultPath: "$.error"
+            Next: WaitForTextract
+
+          WaitForTextract:
+            Type: Wait
+            Seconds: 5
+            Next: CheckJobStatus
+
+          CheckJobStatus:
+            Type: Task
+            Resource: !GetAtt IdpPipelineFunction.Arn
+            Parameters:
+              action: check_status
+              job_id.$: "$.job_id"
+              document_id.$: "$.document_id"
+              s3_bucket.$: "$.s3_bucket"
+              s3_key.$: "$.s3_key"
+              filename.$: "$.filename"
+            ResultPath: "$"
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: HandleFailure
+                ResultPath: "$.error"
+            Next: EvaluateStatus
+
+          EvaluateStatus:
+            Type: Choice
+            Choices:
+              - Variable: "$.job_status"
+                StringEquals: "SUCCEEDED"
+                Next: ProcessAndIndex
+              - Variable: "$.job_status"
+                StringEquals: "FAILED"
+                Next: HandleFailure
+            Default: WaitForTextract
+
+          ProcessAndIndex:
+            Type: Task
+            Resource: !GetAtt IdpPipelineFunction.Arn
+            Parameters:
+              action: process_and_index
+              job_id.$: "$.job_id"
+              document_id.$: "$.document_id"
+              s3_bucket.$: "$.s3_bucket"
+              s3_key.$: "$.s3_key"
+              filename.$: "$.filename"
+            ResultPath: "$"
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: HandleFailure
+                ResultPath: "$.error"
+            End: true
+
+          HandleFailure:
+            Type: Task
+            Resource: !GetAtt IdpPipelineFunction.Arn
+            Parameters:
+              action: handle_failure
+              document_id.$: "$.document_id"
+              error.$: "$.error"
+            End: true
+
+  ##############################################################################
+  # 6. EVENTBRIDGE TRIGGER FOR S3 UPLOADS
+  ##############################################################################
+  S3UploadRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "S3UploadRule-${Environment}"
+      Description: Triggers Step Functions when a document is uploaded to uploads/ in S3
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - "Object Created"
+        detail:
+          bucket:
+            name:
+              - !Ref DocumentStorageBucket
+          object:
+            key:
+              - prefix: "uploads/"
+      Targets:
+        - Arn: !Ref DocumentProcessingStateMachine
+          Id: StepFunctionTarget
+          RoleArn: !GetAtt EventBridgeToStepFunctionsRole.Arn
+
+Outputs:
+  ApiEndpoint:
+    Description: HTTP API Gateway base URL
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+
+  DocumentStorageBucketName:
+    Description: S3 Storage Bucket Name
+    Value: !Ref DocumentStorageBucket
+
+  DocumentMetadataTableName:
+    Description: DynamoDB Metadata Table Name
+    Value: !Ref DocumentMetadataTable
+
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref DocumentProcessingStateMachine
