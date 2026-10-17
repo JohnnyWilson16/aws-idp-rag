@@ -5,9 +5,9 @@ Demonstrates the full IDP + RAG workflow locally:
 1. Ingests local PDF documents (e.g. samples/master_service_agreement.pdf).
 2. Extracts text preserving exact page numbers.
 3. Chunks text with sliding window and metadata attribution.
-4. Generates 384-dimensional embeddings (sentence-transformers/all-MiniLM-L6-v2).
+4. Generates embeddings (Amazon Bedrock Titan V2 / Hugging Face all-MiniLM-L6-v2).
 5. Builds and queries a FAISS IndexFlatIP vector store.
-6. Formulates strictly grounded prompt and retrieves answers with verified page citations.
+6. Formulates strictly grounded prompt and retrieves answers with verified page citations via Bedrock or Hugging Face.
 """
 
 import argparse
@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../s
 from textract_utils import chunk_document_pages
 from embedding_utils import get_batch_embeddings, get_embedding
 from faiss_indexer import add_chunks_to_index, create_empty_index, search_index
-from app import _call_huggingface_llm, _generate_extractive_fallback
+from app import _call_bedrock_llm, _call_huggingface_llm, _generate_extractive_fallback
 
 
 def extract_pages_from_pdf(pdf_path: str) -> Dict[int, Dict]:
@@ -47,16 +47,17 @@ def extract_pages_from_pdf(pdf_path: str) -> Dict[int, Dict]:
 def run_pipeline(
     pdf_paths: List[str],
     queries: List[str],
+    provider: str = "bedrock",
+    model_id: str = "anthropic.claude-3-haiku-20240307-v1:0",
     hf_token: str = "",
-    model_id: str = "meta-llama/Llama-3.2-3B-Instruct",
 ):
     """Execute end-to-end local IDP and RAG verification."""
     print("=" * 70)
-    print("⚡ AWS SERVERLESS IDP + RAG LOCAL PIPELINE VERIFICATION")
+    print(f"⚡ AWS SERVERLESS IDP + RAG PIPELINE ({provider.upper()} MODE)")
     print("=" * 70)
 
     # 1. Document Ingestion & Chunking
-    index = create_empty_index(384)
+    index = None
     metadata_list = []
     total_pages = 0
 
@@ -80,11 +81,16 @@ def run_pipeline(
         print(f"      -> Created {len(chunks)} text chunks with page citations.")
 
         # 2. Embedding Generation
-        print(f"[2/4] Generating 384-d embeddings (sentence-transformers/all-MiniLM-L6-v2)...")
+        print(f"[2/4] Generating embeddings via {provider}...")
         texts = [c["text"] for c in chunks]
-        embeddings = get_batch_embeddings(texts, token=hf_token)
+        embeddings = get_batch_embeddings(texts, provider=provider, token=hf_token)
 
         # 3. Vector Indexing
+        if index is None:
+            dim = embeddings.shape[1]
+            index = create_empty_index(dim)
+            print(f"      -> Initialized FAISS IndexFlatIP (dim={dim})")
+
         print(f"[3/4] Indexing vectors into FAISS IndexFlatIP (Cosine Similarity)...")
         index, metadata_list = add_chunks_to_index(index, metadata_list, chunks, embeddings)
 
@@ -97,7 +103,7 @@ def run_pipeline(
 
     for q_idx, question in enumerate(queries, start=1):
         print(f"\n❓ Question {q_idx}: '{question}'")
-        q_vec = get_embedding(question, token=hf_token)
+        q_vec = get_embedding(question, provider=provider, token=hf_token, model_id=None)
         matches = search_index(index, metadata_list, q_vec, top_k=3)
 
         print(f"   Retrieved {len(matches)} matching chunks:")
@@ -130,13 +136,23 @@ def run_pipeline(
             f"3. Keep the answer clear and concise."
         )
 
-        answer = _call_huggingface_llm(
-            prompt_system=system_prompt,
-            prompt_user=user_prompt,
-            model_id=model_id,
-            hf_token=hf_token,
-            max_tokens=400,
-        )
+        answer = None
+        if provider == "bedrock":
+            answer = _call_bedrock_llm(
+                prompt_system=system_prompt,
+                prompt_user=user_prompt,
+                model_id=model_id,
+                max_tokens=400,
+            )
+
+        if not answer:
+            answer = _call_huggingface_llm(
+                prompt_system=system_prompt,
+                prompt_user=user_prompt,
+                model_id=model_id,
+                hf_token=hf_token,
+                max_tokens=400,
+            )
 
         if not answer:
             answer = _generate_extractive_fallback(question, matches)
@@ -149,13 +165,23 @@ def run_pipeline(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run local RAG pipeline verification")
-    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""), help="Hugging Face API Token")
+    parser.add_argument(
+        "--provider",
+        choices=["bedrock", "huggingface"],
+        default="bedrock",
+        help="AI Provider: 'bedrock' (Amazon Bedrock) or 'huggingface'",
+    )
     parser.add_argument(
         "--model",
-        default="meta-llama/Llama-3.2-3B-Instruct",
-        help="Hugging Face model ID",
+        default=None,
+        help="Model ID (defaults to 'amazon.nova-micro-v1:0' for bedrock, 'meta-llama/Llama-3.2-3B-Instruct' for huggingface)",
     )
+    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""), help="Hugging Face API Token")
     args = parser.parse_args()
+
+    chosen_model = args.model
+    if not chosen_model:
+        chosen_model = "amazon.nova-micro-v1:0" if args.provider == "bedrock" else "meta-llama/Llama-3.2-3B-Instruct"
 
     sample_docs = [
         os.path.abspath(os.path.join(os.path.dirname(__file__), "../samples/master_service_agreement.pdf")),
@@ -172,6 +198,7 @@ if __name__ == "__main__":
     run_pipeline(
         pdf_paths=sample_docs,
         queries=sample_questions,
+        provider=args.provider,
+        model_id=chosen_model,
         hf_token=args.hf_token,
-        model_id=args.model,
     )

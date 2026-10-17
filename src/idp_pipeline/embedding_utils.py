@@ -1,33 +1,46 @@
 """
-Embedding Generator using Hugging Face Serverless Inference API and all-MiniLM-L6-v2.
+Embedding Generator supporting Amazon Bedrock (Titan V2/V1) and Hugging Face.
 
 Features:
-- Free tier serverless embedding generation for 384-dimensional vectors.
-- L2-normalization for exact cosine similarity search in FAISS IndexFlatIP.
-- Batch processing with exponential backoff retry for cold starts.
-- Offline deterministic fallback for local testing and unit tests.
+- Native Amazon Bedrock Titan Text Embeddings V2 (1024-d, 512-d) and V1 (1536-d).
+- Hugging Face Serverless Inference API (all-MiniLM-L6-v2, 384-d).
+- L2-normalization for exact cosine similarity in FAISS IndexFlatIP.
+- Resilient fallback: Bedrock -> Hugging Face -> Deterministic Local Hashing.
 """
 
 import hashlib
+import json
 import logging
 import os
 import time
 from typing import List, Optional, Union
 import numpy as np
 import requests
+import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Default model configuration
-EMBEDDING_MODEL_ID = os.environ.get(
+# Provider & Model configurations
+DEFAULT_PROVIDER = os.environ.get("MODEL_PROVIDER", "bedrock").lower()
+BEDROCK_EMBEDDING_MODEL = os.environ.get(
+    "BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0"
+)
+BEDROCK_REGION = (
+    os.environ.get("BEDROCK_REGION")
+    or os.environ.get("AWS_REGION")
+    or os.environ.get("AWS_DEFAULT_REGION")
+    or "us-east-1"
+)
+BEDROCK_DEFAULT_DIM = 1024
+
+HF_EMBEDDING_MODEL_ID = os.environ.get(
     "EMBEDDING_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2"
 )
-EMBEDDING_DIM = 384
-
-# Hugging Face Router & Legacy Inference URLs
-HF_ROUTER_URL = f"https://router.huggingface.co/hf-inference/models/{EMBEDDING_MODEL_ID}"
-HF_LEGACY_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBEDDING_MODEL_ID}"
+HF_EMBEDDING_DIM = 384
+HF_ROUTER_URL = f"https://router.huggingface.co/hf-inference/models/{HF_EMBEDDING_MODEL_ID}"
+HF_LEGACY_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL_ID}"
 
 
 def _get_hf_headers(token: Optional[str] = None) -> dict:
@@ -49,10 +62,10 @@ def _normalize_vector(vec: np.ndarray) -> np.ndarray:
     return vec / norms
 
 
-def _offline_fallback_embedding(text: str, dim: int = EMBEDDING_DIM) -> np.ndarray:
+def _offline_fallback_embedding(text: str, dim: int = BEDROCK_DEFAULT_DIM) -> np.ndarray:
     """
     Generate a deterministic term-frequency hashed embedding vector for offline testing.
-    Maps words and character tri-grams to 384 dimensions so shared keywords produce high cosine similarity.
+    Maps words and character tri-grams so shared keywords produce high cosine similarity.
     """
     vec = np.zeros(dim, dtype=np.float32)
     words = [w.strip(".,;:!?()[]{}\"'") for w in text.lower().split()]
@@ -64,7 +77,6 @@ def _offline_fallback_embedding(text: str, dim: int = EMBEDDING_DIM) -> np.ndarr
         sign = 1.0 if ((h >> 16) & 1) else -1.0
         vec[idx] += sign
 
-    # Add character n-grams for subword matching
     clean = text.lower().replace(" ", "")
     for i in range(len(clean) - 2):
         gram = clean[i : i + 3]
@@ -75,105 +87,136 @@ def _offline_fallback_embedding(text: str, dim: int = EMBEDDING_DIM) -> np.ndarr
     return _normalize_vector(vec)
 
 
-def get_embedding(
+def get_bedrock_embedding(
     text: str,
-    token: Optional[str] = None,
-    max_retries: int = 3,
+    model_id: str = BEDROCK_EMBEDDING_MODEL,
+    dimensions: int = BEDROCK_DEFAULT_DIM,
+    region_name: Optional[str] = None,
 ) -> np.ndarray:
     """
-    Generate a 384-dimensional normalized embedding vector for a single text.
-
-    Args:
-        text: String input to embed.
-        token: Optional Hugging Face API token.
-        max_retries: Number of retries on 503 model loading response.
-
-    Returns:
-        np.ndarray of shape (384,) float32.
+    Generate embeddings using Amazon Bedrock (Titan Embeddings V2 or V1).
     """
     clean_text = text.replace("\n", " ").strip()
     if not clean_text:
-        return np.zeros(EMBEDDING_DIM, dtype=np.float32)
+        return np.zeros(dimensions, dtype=np.float32)
+
+    region = region_name or BEDROCK_REGION
+    client = boto3.client("bedrock-runtime", region_name=region)
+
+    if "titan-embed-text-v2" in model_id:
+        payload = {
+            "inputText": clean_text,
+            "dimensions": dimensions,
+            "normalize": True,
+        }
+    else:
+        payload = {"inputText": clean_text}
+
+    response = client.invoke_model(
+        modelId=model_id,
+        body=json.dumps(payload),
+        contentType="application/json",
+        accept="application/json",
+    )
+    resp_body = json.loads(response["body"].read())
+    vec = np.array(resp_body["embedding"], dtype=np.float32)
+    return _normalize_vector(vec)
+
+
+def get_hf_embedding(
+    text: str,
+    token: Optional[str] = None,
+    max_retries: int = 2,
+) -> np.ndarray:
+    """
+    Generate normalized embeddings using Hugging Face Serverless API.
+    """
+    clean_text = text.replace("\n", " ").strip()
+    if not clean_text:
+        return np.zeros(HF_EMBEDDING_DIM, dtype=np.float32)
 
     headers = _get_hf_headers(token)
-
-    # Try router URL first, fallback to legacy URL
     endpoints = [HF_ROUTER_URL, HF_LEGACY_URL]
 
     for attempt in range(max_retries):
         for url in endpoints:
             try:
-                payload = {
-                    "inputs": clean_text,
-                    "options": {"wait_for_model": True},
-                }
-                response = requests.post(
+                res = requests.post(
                     url,
                     headers=headers,
-                    json=payload,
-                    timeout=20,
+                    json={"inputs": clean_text, "options": {"wait_for_model": True}},
+                    timeout=15,
                 )
-
-                if response.status_code == 200:
-                    data = response.json()
+                if res.status_code == 200:
+                    data = res.json()
                     vec = np.array(data, dtype=np.float32)
-                    # If model returns nested [1, 384] or [seq_len, 384], reduce to mean
                     if vec.ndim == 2:
                         vec = np.mean(vec, axis=0)
                     elif vec.ndim > 2:
-                        vec = vec.flatten()[:EMBEDDING_DIM]
-
-                    if vec.shape[0] == EMBEDDING_DIM:
+                        vec = vec.flatten()[:HF_EMBEDDING_DIM]
+                    if vec.shape[0] == HF_EMBEDDING_DIM:
                         return _normalize_vector(vec)
-                    else:
-                        logger.warning(f"Unexpected embedding dimension: {vec.shape}")
-
-                elif response.status_code == 503:
-                    data = response.json()
-                    wait_time = data.get("estimated_time", 10)
-                    logger.warning(
-                        f"HF model {EMBEDDING_MODEL_ID} is loading. Waiting {wait_time}s..."
-                    )
-                    time.sleep(min(wait_time, 15))
-                    continue
-
-                elif response.status_code in (401, 403):
-                    logger.warning(
-                        f"HF API returned {response.status_code}: Token missing or invalid. Using offline fallback."
-                    )
-                    return _offline_fallback_embedding(clean_text)
-
             except Exception as e:
-                logger.warning(f"Error querying {url}: {e}")
+                logger.warning(f"HF embedding error: {e}")
+        time.sleep(1)
 
-        time.sleep(2 ** attempt)
+    return _offline_fallback_embedding(clean_text, dim=HF_EMBEDDING_DIM)
 
-    logger.warning("Falling back to local deterministic embedding generator.")
-    return _offline_fallback_embedding(clean_text)
+
+def get_embedding(
+    text: str,
+    provider: Optional[str] = None,
+    model_id: Optional[str] = None,
+    token: Optional[str] = None,
+    region_name: Optional[str] = None,
+) -> np.ndarray:
+    """
+    Unified embedding entrypoint.
+    Prioritizes Amazon Bedrock (if configured), falling back to Hugging Face or offline hashing.
+    """
+    chosen_provider = (provider or DEFAULT_PROVIDER).lower()
+
+    if chosen_provider == "bedrock":
+        try:
+            m_id = model_id or BEDROCK_EMBEDDING_MODEL
+            return get_bedrock_embedding(text, model_id=m_id, region_name=region_name)
+        except Exception as e:
+            logger.warning(f"Amazon Bedrock embedding failed ({e}), falling back to Hugging Face / offline.")
+
+    # Hugging Face or local fallback
+    if token or os.environ.get("HF_TOKEN") or chosen_provider == "huggingface":
+        try:
+            return get_hf_embedding(text, token=token)
+        except Exception as e:
+            logger.warning(f"HF embedding failed ({e}), using offline fallback.")
+
+    target_dim = BEDROCK_DEFAULT_DIM if chosen_provider == "bedrock" else HF_EMBEDDING_DIM
+    return _offline_fallback_embedding(text, dim=target_dim)
 
 
 def get_batch_embeddings(
     texts: List[str],
+    provider: Optional[str] = None,
+    model_id: Optional[str] = None,
     token: Optional[str] = None,
     batch_size: int = 8,
+    region_name: Optional[str] = None,
 ) -> np.ndarray:
     """
     Generate normalized embeddings for a list of texts in batches.
-
-    Args:
-        texts: List of text strings.
-        token: Optional Hugging Face API token.
-        batch_size: Number of texts per batch.
-
-    Returns:
-        np.ndarray of shape (N, 384) float32.
     """
     all_embeddings: List[np.ndarray] = []
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
         for t in batch:
-            emb = get_embedding(t, token=token)
+            emb = get_embedding(
+                t,
+                provider=provider,
+                model_id=model_id,
+                token=token,
+                region_name=region_name,
+            )
             all_embeddings.append(emb)
 
     return np.vstack(all_embeddings).astype(np.float32)

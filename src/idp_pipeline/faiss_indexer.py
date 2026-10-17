@@ -23,7 +23,7 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-VECTOR_DIM = 384
+VECTOR_DIM = int(os.environ.get("VECTOR_DIM", "1024"))
 INDEX_S3_KEY = "vector_store/index.faiss"
 METADATA_S3_KEY = "vector_store/metadata.pkl"
 
@@ -34,7 +34,7 @@ def get_s3_client(region_name: Optional[str] = None) -> Any:
 
 
 def create_empty_index(dim: int = VECTOR_DIM) -> faiss.IndexFlatIP:
-    """Create a new FAISS Flat Inner Product index for 384-dimensional vectors."""
+    """Create a new FAISS Flat Inner Product index for dense vectors."""
     return faiss.IndexFlatIP(dim)
 
 
@@ -135,6 +135,13 @@ def add_chunks_to_index(
 
     # Ensure float32 format
     embeddings = np.ascontiguousarray(new_embeddings, dtype=np.float32)
+    dim = embeddings.shape[1]
+
+    # Reinitialize if index dimension does not match incoming vectors
+    if index is None or index.d != dim:
+        logger.info(f"Adapting FAISS index dimension to match vectors: {dim}")
+        index = create_empty_index(dim)
+        metadata_list = []
 
     # Normalize vectors to unit length for cosine similarity
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)

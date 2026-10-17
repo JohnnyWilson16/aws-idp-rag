@@ -75,6 +75,25 @@ class TestFAISSIndexer(unittest.TestCase):
         self.assertEqual(results2[0]["doc_name"], "invoice.pdf")
         self.assertEqual(results2[0]["page_number"], 2)
 
+    def test_bedrock_1024_dimension_indexing(self):
+        """Verify that index dynamically adapts to 1024-dimensional Bedrock Titan vectors."""
+        dim_1024 = 1024
+        chunks = [
+            {"chunk_id": "c1", "doc_name": "contract.pdf", "page_number": 1, "text": "Clause 1"},
+            {"chunk_id": "c2", "doc_name": "contract.pdf", "page_number": 2, "text": "Clause 2"},
+        ]
+        rng = np.random.RandomState(42)
+        raw_vecs = rng.randn(2, dim_1024).astype(np.float32)
+
+        idx, meta = add_chunks_to_index(None, [], chunks, raw_vecs)
+        self.assertEqual(idx.d, 1024)
+        self.assertEqual(idx.ntotal, 2)
+
+        query = raw_vecs[0]
+        results = search_index(idx, meta, query, top_k=1)
+        self.assertEqual(results[0]["chunk_id"], "c1")
+        self.assertAlmostEqual(results[0]["score"], 1.0, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

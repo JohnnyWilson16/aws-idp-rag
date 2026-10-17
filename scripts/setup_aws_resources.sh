@@ -9,7 +9,7 @@ ENV="dev"
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
 echo "=================================================================="
-echo "⚡ AWS SERVERLESS IDP + RAG DEPLOYMENT (ZERO BEDROCK / FREE TIER)"
+echo "⚡ AWS SERVERLESS IDP + RAG DEPLOYMENT (BEDROCK NATIVE / LOW COST)"
 echo "=================================================================="
 
 usage() {

@@ -168,13 +168,20 @@ def handle_process_and_index(event: Dict[str, Any]) -> Dict[str, Any]:
     )
     chunk_count = len(chunks)
 
-    # 4. Generate embeddings via Hugging Face Inference API
+    # 4. Generate embeddings via Amazon Bedrock (or Hugging Face fallback)
+    provider = event.get("provider") or os.environ.get("MODEL_PROVIDER", "bedrock").lower()
+    model_id = event.get("embedding_model") or os.environ.get("BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
     chunk_texts = [c["text"] for c in chunks]
 
     if chunk_texts:
-        logger.info(f"Generating embeddings for {len(chunk_texts)} chunks...")
-        embeddings = get_batch_embeddings(chunk_texts, token=hf_token)
+        logger.info(f"Generating embeddings for {len(chunk_texts)} chunks using provider: {provider} ({model_id})...")
+        embeddings = get_batch_embeddings(
+            chunk_texts,
+            provider=provider,
+            model_id=model_id,
+            token=hf_token,
+        )
 
         # 5. Load or create FAISS index from S3 and append new vectors
         index, metadata_list = load_index_from_s3(s3_bucket)

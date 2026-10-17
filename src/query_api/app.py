@@ -3,10 +3,10 @@ AWS Lambda Handler for Query & RAG Retrieval API.
 
 Performs:
 1. Loads/caches S3-backed FAISS vector store into Lambda /tmp.
-2. Embeds user query using all-MiniLM-L6-v2.
+2. Embeds user query using Amazon Bedrock Titan or Hugging Face all-MiniLM-L6-v2.
 3. Retrieves Top-K relevant document chunks with page-level metadata.
 4. Constructs strictly grounded context prompt to prevent hallucinations.
-5. Invokes Hugging Face Serverless Inference API for LLM text generation.
+5. Invokes Amazon Bedrock Converse API (Claude 3 Haiku / Nova / Llama 3) with Hugging Face fallback.
 6. Returns verified answer and structured source citations.
 """
 
@@ -29,12 +29,23 @@ logger.setLevel(logging.INFO)
 
 # Environment variables
 S3_BUCKET_NAME = os.environ.get("DOCUMENT_BUCKET_NAME", "")
-DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL_ID", "meta-llama/Llama-3.2-3B-Instruct")
+DEFAULT_PROVIDER = os.environ.get("MODEL_PROVIDER", "bedrock").lower()
+BEDROCK_DEFAULT_LLM_MODEL = os.environ.get(
+    "BEDROCK_LLM_MODEL", "amazon.nova-micro-v1:0"
+)
+BEDROCK_REGION = (
+    os.environ.get("BEDROCK_REGION")
+    or os.environ.get("AWS_REGION")
+    or os.environ.get("AWS_DEFAULT_REGION")
+    or "us-east-1"
+)
+
+HF_DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL_ID", "meta-llama/Llama-3.2-3B-Instruct")
 FALLBACK_LLM_MODELS = [
     "Qwen/Qwen2.5-7B-Instruct",
     "mistralai/Mistral-7B-Instruct-v0.3",
 ]
-VECTOR_DIM = 384
+
 INDEX_S3_KEY = "vector_store/index.faiss"
 METADATA_S3_KEY = "vector_store/metadata.pkl"
 
@@ -100,7 +111,7 @@ def _load_cached_vector_store(
             _CACHED_METADATA = pickle.load(f)
         _CACHED_ETAG = s3_etag
 
-        logger.info(f"Vector store loaded successfully: {_CACHED_INDEX.ntotal} vectors")
+        logger.info(f"Vector store loaded successfully: {_CACHED_INDEX.ntotal} vectors (dim={_CACHED_INDEX.d})")
         return _CACHED_INDEX, _CACHED_METADATA
 
     except ClientError as e:
@@ -148,6 +159,41 @@ def _retrieve_top_k(
     return results
 
 
+def _call_bedrock_llm(
+    prompt_system: str,
+    prompt_user: str,
+    model_id: str = BEDROCK_DEFAULT_LLM_MODEL,
+    region_name: Optional[str] = None,
+    max_tokens: int = 512,
+) -> Optional[str]:
+    """
+    Call Amazon Bedrock using the unified Converse API.
+    Supports Anthropic Claude (3.5 Sonnet, 3 Haiku), Amazon Nova, Meta Llama, and Mistral.
+    """
+    region = region_name or BEDROCK_REGION
+    logger.info(f"Calling Amazon Bedrock Converse API with model {model_id} in {region}")
+
+    try:
+        bedrock = boto3.client("bedrock-runtime", region_name=region)
+        response = bedrock.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt_user}]}],
+            system=[{"text": prompt_system}],
+            inferenceConfig={
+                "maxTokens": max_tokens,
+                "temperature": 0.1,
+                "topP": 0.9,
+            },
+        )
+        output_content = response.get("output", {}).get("message", {}).get("content", [])
+        if output_content and "text" in output_content[0]:
+            return output_content[0]["text"].strip()
+    except Exception as e:
+        logger.warning(f"Amazon Bedrock Converse call failed for {model_id}: {e}")
+
+    return None
+
+
 def _call_huggingface_llm(
     prompt_system: str,
     prompt_user: str,
@@ -156,8 +202,7 @@ def _call_huggingface_llm(
     max_tokens: int = 512,
 ) -> Optional[str]:
     """
-    Call Hugging Face Serverless Inference API for chat or text generation.
-    Supports chat completion API and falls back to standard inference pipeline.
+    Call Hugging Face Serverless Inference API for chat or text generation (fallback).
     """
     api_token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN", "")
     headers = {"Content-Type": "application/json"}
@@ -185,7 +230,7 @@ def _call_huggingface_llm(
 
         for chat_url in chat_urls:
             try:
-                res = requests.post(chat_url, headers=headers, json=chat_payload, timeout=25)
+                res = requests.post(chat_url, headers=headers, json=chat_payload, timeout=20)
                 if res.status_code == 200:
                     data = res.json()
                     choices = data.get("choices", [])
@@ -211,7 +256,7 @@ def _call_huggingface_llm(
 
         for gen_url in gen_urls:
             try:
-                res = requests.post(gen_url, headers=headers, json=gen_payload, timeout=25)
+                res = requests.post(gen_url, headers=headers, json=gen_payload, timeout=20)
                 if res.status_code == 200:
                     data = res.json()
                     if isinstance(data, list) and len(data) > 0:
@@ -241,7 +286,6 @@ def _generate_extractive_fallback(question: str, sources: List[Dict[str, Any]]) 
         page_num = s.get("page_number", 1)
         raw_text = s.get("snippet") or s.get("text", "")
         lines.append(f"• **[Document: {doc_name}, Page: {page_num}]**:")
-        # Provide concise snippet
         clean_snip = " ".join(raw_text.split()[:80])
         lines.append(f'  "{clean_snip}..."')
         lines.append("")
@@ -279,10 +323,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     top_k = min(int(body.get("top_k", 3)), 10)
     user_token = body.get("hf_token")
-    requested_model = body.get("model", DEFAULT_LLM_MODEL)
+    provider = (body.get("provider") or DEFAULT_PROVIDER).lower()
     bucket_name = body.get("s3_bucket") or S3_BUCKET_NAME
 
-    # 1. Load vector store
+    if provider == "bedrock":
+        requested_model = body.get("model") or BEDROCK_DEFAULT_LLM_MODEL
+    else:
+        requested_model = body.get("model") or HF_DEFAULT_LLM_MODEL
+
+    # 1. Load vector store from S3
     index, metadata_list = _load_cached_vector_store(bucket_name)
     if index is None or index.ntotal == 0:
         return _respond(
@@ -292,11 +341,18 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "sources": [],
                 "chunks_retrieved": 0,
                 "model_used": "none",
+                "provider": provider,
             },
         )
 
-    # 2. Embed user question
-    query_vector = get_query_embedding(question, token=user_token)
+    # 2. Embed user question matching the index vector dimension
+    target_dim = index.d if index is not None else None
+    query_vector = get_query_embedding(
+        question,
+        provider=provider,
+        token=user_token,
+        target_dim=target_dim,
+    )
 
     # 3. Retrieve Top-K chunks
     sources = _retrieve_top_k(index, metadata_list, query_vector, top_k=top_k)
@@ -308,7 +364,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "answer": "I cannot find any relevant excerpts in the provided documents to answer this question.",
                 "sources": [],
                 "chunks_retrieved": 0,
-                "model_used": "none",
+                "model_used": requested_model,
+                "provider": provider,
             },
         )
 
@@ -340,19 +397,33 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         f"3. Keep your response direct, professional, and clear."
     )
 
-    # 5. Call Hugging Face Serverless LLM
-    answer = _call_huggingface_llm(
-        prompt_system=system_prompt,
-        prompt_user=user_prompt,
-        model_id=requested_model,
-        hf_token=user_token,
-        max_tokens=512,
-    )
+    # 5. Call LLM (Amazon Bedrock first if configured, else Hugging Face, else extractive fallback)
+    answer = None
+    model_used = requested_model
 
-    # If external API unavailable, use structured extractive fallback
+    if provider == "bedrock":
+        answer = _call_bedrock_llm(
+            prompt_system=system_prompt,
+            prompt_user=user_prompt,
+            model_id=requested_model,
+            max_tokens=512,
+        )
+
+    if not answer and (provider == "huggingface" or user_token or os.environ.get("HF_TOKEN")):
+        answer = _call_huggingface_llm(
+            prompt_system=system_prompt,
+            prompt_user=user_prompt,
+            model_id=HF_DEFAULT_LLM_MODEL if provider == "bedrock" else requested_model,
+            hf_token=user_token,
+            max_tokens=512,
+        )
+        if answer:
+            model_used = HF_DEFAULT_LLM_MODEL if provider == "bedrock" else requested_model
+
     if not answer:
-        logger.info("External LLM did not respond. Using extractive citation fallback.")
+        logger.info("External LLMs unavailable. Using extractive citation fallback.")
         answer = _generate_extractive_fallback(question, sources)
+        model_used = "extractive-fallback"
 
     return _respond(
         200,
@@ -361,6 +432,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "answer": answer,
             "sources": sources,
             "chunks_retrieved": len(sources),
-            "model_used": requested_model,
+            "model_used": model_used,
+            "provider": provider,
         },
     )

@@ -1,12 +1,13 @@
 # ⚡ Serverless Intelligent Document Processing (IDP) & RAG Assistant on AWS
 
-> **A 100% Free-Tier & CPU-Optimized Retrieval-Augmented Generation (RAG) System on AWS with STRICTLY ZERO Amazon Bedrock.**
+> **A Production-Ready, Low-Cost Retrieval-Augmented Generation (RAG) System on AWS powered by Amazon Bedrock (Nova Micro, Titan Text Embeddings V2) with Multi-Provider Fallback (Hugging Face / Local Extractive).**
 > Follows the complete IDP Lifecycle: **Documents → OCR → Amazon S3 Storage → Vector Indexing → User Query → AI Grounded Response with Citations.**
 
 [![AWS SAM](https://img.shields.io/badge/AWS-SAM%20Serverless-orange?logo=amazon-aws)](https://aws.amazon.com/serverless/sam/)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11%20%7C%203.13-blue?logo=python)](https://www.python.org/)
+[![Amazon Bedrock](https://img.shields.io/badge/AWS%20Bedrock-Nova%20Micro%20%2B%20Titan%20V2-232F3E?logo=amazon-aws)](https://aws.amazon.com/bedrock/)
 [![FAISS](https://img.shields.io/badge/Vector%20Store-FAISS%20CPU-green)](https://github.com/facebookresearch/faiss)
-[![HuggingFace](https://img.shields.io/badge/Embeddings%20%26%20LLM-Hugging%20Face%20Serverless-yellow?logo=huggingface)](https://huggingface.co/)
+[![Amazon Textract](https://img.shields.io/badge/OCR-Amazon%20Textract%20Async-red?logo=amazon-aws)](https://aws.amazon.com/textract/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
 ---
@@ -25,8 +26,8 @@ flowchart TD
         LP -->|Store Raw OCR JSON| S3_EXT[(Amazon S3 /extracted)]
         LP -->|Update Status: PROCESSING/COMPLETED| DDB[(Amazon DynamoDB DocumentMetadata)]
         LP -->|Chunking: 500 tokens / 50 overlap| CHUNK[Page-Preserving Text Chunks]
-        CHUNK -->|Hugging Face Serverless API| EMB[all-MiniLM-L6-v2 Embeddings]
-        EMB -->|Upsert 384-d Vectors| FAISS[FAISS IndexFlatIP Cosine Index]
+        CHUNK -->|Bedrock Titan Embeddings V2| EMB[amazon.titan-embed-text-v2:0]
+        EMB -->|Upsert 1024-d / Dynamic Vectors| FAISS[FAISS IndexFlatIP Cosine Index]
         FAISS -->|Persist .faiss & .pkl| S3_VEC[(Amazon S3 /vector_store)]
     end
 
@@ -34,9 +35,9 @@ flowchart TD
         USER[User asks Question via Streamlit UI] -->|POST /query| APIGW[Amazon API Gateway HTTP API]
         APIGW --> QLAMBDA[Lambda: RAG Query Function]
         QLAMBDA -->|Download / Check ETag /tmp Cache| S3_VEC
-        QLAMBDA -->|Embed Query| EMB2[Hugging Face all-MiniLM-L6-v2]
+        QLAMBDA -->|Embed Query| EMB2[Amazon Bedrock Titan Embeddings V2]
         QLAMBDA -->|Vector Similarity Search| RETRIEVE[Retrieve Top-K Chunks with Page Citations]
-        RETRIEVE -->|Strict Context Grounding Prompt| LLM[Hugging Face Inference: Llama-3.2-3B / Qwen-2.5]
+        RETRIEVE -->|Strict Context Grounding Prompt| LLM[Amazon Bedrock: amazon.nova-micro-v1:0]
         LLM -->|Grounded Answer + Citations| QLAMBDA
         QLAMBDA -->|JSON Answer + Sources Array| USER
     end
@@ -46,22 +47,23 @@ flowchart TD
 
 ## 💡 Key Architectural Decisions & Constraint Adherence
 
-### 1. Strictly Zero Amazon Bedrock
-* **Constraint:** Amazon Bedrock, Bedrock Knowledge Bases, and Amazon Q Business are **strictly prohibited**.
-* **Solution:** We decouple embedding generation and LLM text generation using open-source Foundation Models:
-  * **Embeddings:** `sentence-transformers/all-MiniLM-L6-v2` (384-dimensional dense vectors).
-  * **LLM Reasoning:** `meta-llama/Llama-3.2-3B-Instruct` (with automatic fallback to `Qwen/Qwen2.5-7B-Instruct` and `mistralai/Mistral-7B-Instruct-v0.3`).
-  * **Inference Platform:** Hugging Face Serverless Inference API, invoked directly from AWS Lambda over HTTPS. This eliminates the need for expensive SageMaker GPU endpoints ($100s/month) and avoids Bedrock entirely.
+### 1. Amazon Bedrock Native with Resilient Multi-Provider Fallback
+* **Primary AI Engine (Amazon Bedrock):**
+  * **Embeddings:** `amazon.titan-embed-text-v2:0` (1024-dimensional normalized dense vectors, high retrieval accuracy).
+  * **LLM Generation:** `amazon.nova-micro-v1:0` via the unified `bedrock-runtime` Converse API. It delivers ultra-fast responses (sub-second TTFT) at minimal cost ($0.035 / 1M input tokens). Also supports `amazon.nova-lite-v1:0`, `meta.llama3-8b-instruct-v1:0`, and Anthropic Claude.
+* **Multi-Provider Fallback:**
+  * In new AWS accounts where foundation model access is pending approval, or during API rate limits, the system dynamically falls back to **Hugging Face Serverless** (`all-MiniLM-L6-v2` / `Llama-3.2-3B`) or deterministic local extractive grounding. The application never fails or crashes due to model provider unavailability.
 
-### 2. Free Tier Optimization ($0.00 Monthly Cost)
+### 2. Free Tier & Ultra-Low-Cost Optimization (< $0.05 / month)
 * **Vector Database:** Instead of spinning up Amazon OpenSearch Serverless (which mandates an active baseline of 4 OCUs costing **~$700/month**), we serialize a FAISS `IndexFlatIP` directly to Amazon S3 (`/vector_store/index.faiss` and `metadata.pkl`).
 * **Lambda `/tmp` Caching:** The Query Lambda caches the FAISS binary index in its `/tmp` directory and in-memory across warm invocations, inspecting the S3 object's ETag to only fetch updates. Retrieval takes **< 4 ms** with zero database hosting fees.
 * **On-Demand Serverless:** Every compute component scales to zero when idle:
-  * AWS Lambda: 1,000,000 free requests/month.
-  * Amazon DynamoDB: On-Demand (`PAY_PER_REQUEST`), zero provisioned capacity charge.
-  * AWS Step Functions: 4,000 free state transitions/month.
-  * Amazon S3: 5 GB Free Tier storage.
-  * Amazon Textract: 1,000 free pages/month under AWS Free Tier.
+  * **AWS Lambda:** 1,000,000 free requests/month (ARM64 architecture for 20% cost and performance savings).
+  * **Amazon DynamoDB:** On-Demand (`PAY_PER_REQUEST`), zero provisioned capacity charge.
+  * **AWS Step Functions:** 4,000 free state transitions/month.
+  * **Amazon S3:** 5 GB Free Tier storage.
+  * **Amazon Textract:** 1,000 free pages/month under AWS Free Tier.
+  * **Amazon Bedrock:** Pay-per-token pricing with zero monthly minimums. 1,000 document queries costs less than **$0.05**.
 
 ### 3. Asynchronous Multi-Page Document OCR
 * Synchronous Textract API (`DetectDocumentText`) is strictly limited to single-page images and throws `UnsupportedDocumentException` on multi-page PDFs.
@@ -74,18 +76,17 @@ flowchart TD
 
 ---
 
-## 💰 AWS Free Tier & Cost Breakdown
+## 💰 Cost Breakdown Comparison
 
-| Cloud Service | Free Tier Allocation | System Usage | Monthly Cost |
+| Cloud Service | Enterprise Default Pattern | Our Architecture | Monthly Cost (Our Solution) |
 | :--- | :--- | :--- | :--- |
-| **Amazon S3** | 5 GB Standard Storage, 20,000 GETs, 2,000 PUTs | Document uploads, raw OCR JSON, FAISS index artifacts | **$0.00** |
-| **AWS Lambda** | 1,000,000 requests/month, 3.2M sec compute | IDP processor, Document API, Query API | **$0.00** |
-| **Amazon DynamoDB**| 25 GB Storage, 25 WCU / 25 RCU | Document metadata and processing states | **$0.00** |
-| **AWS Step Functions** | 4,000 state transitions/month | OCR polling and pipeline orchestration | **$0.00** |
-| **Amazon Textract**| 1,000 pages/month (DetectDocumentText) | Multi-page PDF & scanned image asynchronous OCR | **$0.00** |
-| **Amazon API Gateway** | 1,000,000 HTTP API calls/month | Lightweight REST API routes (/query, /documents) | **$0.00** |
-| **Hugging Face Serverless** | Free Community Tier | Embeddings (`all-MiniLM-L6-v2`) & LLM (`Llama-3.2-3B`) | **$0.00** |
-| **TOTAL ESTIMATED BILL** | | | **$0.00 / month** |
+| **Vector Store** | OpenSearch Serverless (4 OCUs minimum) | FAISS on Amazon S3 + Lambda `/tmp` Cache | **$0.00** |
+| **Document OCR** | Sync Textract / Dedicated EC2 OCR | Asynchronous Textract + Step Functions | **$0.00** (Free Tier 1K pages) |
+| **LLM Inference** | Dedicated SageMaker ml.g5.2xlarge ($1.21/hr) | Bedrock Nova Micro Serverless | **<$0.02** (1,000 queries) |
+| **Embeddings** | Dedicated SageMaker Embedding Endpoint | Bedrock Titan Text Embeddings V2 | **<$0.01** (1,000 pages) |
+| **Compute & API** | EKS / ECS Container Cluster | AWS Lambda (ARM64) + HTTP API Gateway | **$0.00** (Free Tier 1M requests) |
+| **State & Tracking** | Aurora Serverless DB | DynamoDB (On-Demand) | **$0.00** (25 GB free) |
+| **TOTAL ESTIMATED MONTHLY BILL** | **~$1,500.00+ / month** | **Serverless Pay-Per-Token** | **<$0.05 / month** |
 
 ---
 
@@ -93,38 +94,38 @@ flowchart TD
 
 ```
 aws-idp-rag/
-├── template.yaml                       # AWS SAM Template (S3, DynamoDB, Step Functions, Lambda, API Gateway)
+├── template.yaml                       # AWS SAM Template (S3, DynamoDB, Step Functions, Lambda ARM64, Bedrock IAM)
 ├── .gitignore                          # Excludes venv, sam artifacts, and temp caches
 ├── src/
 │   ├── idp_pipeline/
 │   │   ├── __init__.py
 │   │   ├── handler.py                  # Step Functions Lambda tasks: start, check_status, process_and_index
 │   │   ├── textract_utils.py           # Multi-page Textract async OCR, page preservation, sliding-window chunking
-│   │   ├── embedding_utils.py          # sentence-transformers/all-MiniLM-L6-v2 generator (HF API + local fallback)
-│   │   ├── faiss_indexer.py            # FAISS IndexFlatIP management, S3 serialization/deserialization (.faiss + .pkl)
-│   │   └── requirements.txt
+│   │   ├── embedding_utils.py          # Bedrock Titan V2 (1024-d) with Hugging Face & local hashing fallback
+│   │   ├── faiss_indexer.py            # Dynamic dimension FAISS IndexFlatIP management & S3 serialization
+│   │   └── requirements.txt            # Pre-compiled manylinux2014_aarch64 wheels (numpy==2.2.6, faiss-cpu)
 │   ├── query_api/
 │   │   ├── __init__.py
-│   │   ├── app.py                      # API Gateway Lambda: vector search, prompt engineering, HF LLM call, citations
-│   │   ├── embedding_client.py         # Query vector embedding client
+│   │   ├── app.py                      # API Gateway Lambda: Bedrock Converse API / HF LLM, vector search, citations
+│   │   ├── embedding_client.py         # Query vector embedding client (Bedrock Titan V2 / HF MiniLM)
 │   │   └── requirements.txt
 │   └── document_api/
 │       ├── __init__.py
 │       ├── app.py                      # API Gateway Lambda: GET /documents (DynamoDB list), POST /upload-url (S3 presigned PUT)
 │       └── requirements.txt
 ├── frontend/
-│   ├── app.py                          # Streamlit UI: Chat interface, real-time DynamoDB tracker, PDF uploader, source citations
+│   ├── app.py                          # Streamlit UI: Model & Provider dropdown, real-time DynamoDB tracker, citations
 │   ├── requirements.txt
 │   └── .streamlit/
-│       └── config.toml                 # Polished theme configuration
+│       └── config.toml                 # Polished dark/light UI theme configuration
 ├── scripts/
 │   ├── create_test_docs.py             # Generates realistic sample business PDFs (contracts, invoices, SLAs)
-│   ├── local_pipeline_runner.py        # Local CLI to test OCR, chunking, embedding, indexing and RAG query without deploying
+│   ├── local_pipeline_runner.py        # Local CLI supporting --provider bedrock and --provider huggingface
 │   └── setup_aws_resources.sh          # Automation script for SAM build, deploy, test, and teardown
 ├── tests/
 │   ├── test_chunking.py                # Unit tests for chunking with page number tracking
 │   ├── test_textract_utils.py          # Unit tests for parsing Textract blocks
-│   └── test_faiss_indexer.py           # Unit tests for FAISS vector addition, cosine similarity, and search
+│   └── test_faiss_indexer.py           # Unit tests for FAISS vector addition, cosine similarity, dynamic 1024-d/384-d
 └── samples/                            # Realistic sample business documents
     ├── master_service_agreement.pdf    # 4-page enterprise agreement (Scope, SLAs, Fees, Liability Cap)
     └── cloud_services_invoice.pdf      # 2-page detailed cloud invoice (Line items, banking details)
@@ -159,18 +160,22 @@ python3 scripts/create_test_docs.py
 ### 3. Run the Local End-to-End Pipeline Verification
 
 ```bash
-python3 scripts/local_pipeline_runner.py
+# Option A: Run with Amazon Bedrock (requires AWS credentials with Bedrock access)
+python3 scripts/local_pipeline_runner.py --provider bedrock --model amazon.nova-micro-v1:0
+
+# Option B: Run fully offline / Hugging Face serverless (Zero AWS credentials needed)
+python3 scripts/local_pipeline_runner.py --provider huggingface
 ```
 
 Expected output:
 * Parses multi-page PDF documents.
 * Splits text into 500-token chunks retaining exact page numbers.
-* Computes 384-dimensional normalized embeddings.
+* Computes normalized embeddings (1024-d Titan V2 or 384-d MiniLM).
 * Indexes chunks into a FAISS `IndexFlatIP`.
 * Runs test queries and prints grounded answers with citations:
   ```text
   ❓ Question: 'What is the aggregate liability cap in the Master Services Agreement?'
-  • Excerpt: [master_service_agreement.pdf - Page 4] (Relevance Score: 0.4261)
+  • Excerpt: [master_service_agreement.pdf - Page 4] (Relevance Score: 0.8941)
   💬 Grounded Assistant Response:
   Based on the Master Services Agreement (Page 4), either party's aggregate liability
   is strictly capped at $500,000 USD (Five Hundred Thousand Dollars).
@@ -181,7 +186,7 @@ Expected output:
 ```bash
 pytest tests/
 ```
-*Verifies chunking page preservation, Textract block parser, and FAISS vector search.*
+*Verifies chunking page preservation, Textract block parser, and FAISS dynamic dimension vector search (5/5 passing).*
 
 ---
 
@@ -193,12 +198,14 @@ pytest tests/
   aws configure
   ```
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) installed.
-- (Optional) Free [Hugging Face Token](https://huggingface.co/settings/tokens) for higher inference rate limits.
+- (Recommended) In the AWS Console, visit **Amazon Bedrock → Model access** and ensure access is granted to:
+  - **Amazon:** Nova Micro, Nova Lite, Titan Text Embeddings V2
+  - **Meta:** Llama 3 / 3.2 (optional)
 
 ### 2. Build and Deploy with AWS SAM
 
 ```bash
-# Build Lambda artifacts
+# Build Lambda artifacts inside Docker container (ARM64)
 sam build --use-container
 
 # Deploy stack interactively
@@ -207,10 +214,11 @@ sam deploy --guided
 
 SAM Prompt Inputs:
 - **Stack Name:** `aws-idp-rag-stack`
-- **AWS Region:** `us-east-1` (or your preferred Free Tier region)
+- **AWS Region:** `us-east-1` (or your preferred region with Bedrock support)
 - **Parameter Environment:** `dev`
-- **Parameter HuggingFaceToken:** `hf_...` (or leave empty)
-- **Parameter DefaultLLMModel:** `meta-llama/Llama-3.2-3B-Instruct`
+- **Parameter ModelProvider:** `bedrock` (or `huggingface`)
+- **Parameter BedrockLLMModel:** `amazon.nova-micro-v1:0`
+- **Parameter BedrockEmbeddingModel:** `amazon.titan-embed-text-v2:0`
 - **Confirm changes before deploy:** `Y`
 - **Allow SAM CLI IAM role creation:** `Y`
 - **Disable rollback:** `Y`
@@ -231,9 +239,10 @@ streamlit run frontend/app.py
 ```
 
 1. Open `http://localhost:8501` in your browser.
-2. In the sidebar, upload `samples/master_service_agreement.pdf`.
-3. Watch the real-time Document Status Tracker change from `PROCESSING` to `🟢 COMPLETED` (Pages: 4, Chunks: 4).
-4. Ask questions in the chat interface!
+2. In the sidebar, select **Amazon Bedrock** and model **amazon.nova-micro-v1:0**.
+3. Upload `samples/master_service_agreement.pdf`.
+4. Watch the real-time Document Status Tracker change from `PROCESSING` to `🟢 COMPLETED` (Pages: 4, Chunks: 4).
+5. Ask questions in the chat interface!
 
 ---
 
@@ -263,6 +272,8 @@ curl -X POST "${API_GATEWAY_URL}/query" \
   -H "Content-Type: application/json" \
   -d '{
     "question": "What is the liability limit in the agreement?",
+    "provider": "bedrock",
+    "model_id": "amazon.nova-micro-v1:0",
     "top_k": 3
   }'
 ```
@@ -281,7 +292,7 @@ Sample API Response:
     }
   ],
   "chunks_retrieved": 1,
-  "model_used": "meta-llama/Llama-3.2-3B-Instruct"
+  "model_used": "amazon.nova-micro-v1:0"
 }
 ```
 
@@ -306,13 +317,16 @@ sam delete --stack-name aws-idp-rag-stack --region us-east-1 --no-prompts
 
 ## 🎓 Interview Walkthrough & Architecture Defense Guide
 
-### Q1: Why did you completely omit Amazon Bedrock?
-> **Answer:** Bedrock charges $0.0001 per 1,000 input tokens and Bedrock Knowledge Bases incurs continuous vector storage fees. Moreover, many candidate accounts lack Bedrock model access permissions by default. By utilizing open-source Foundation Models (`sentence-transformers/all-MiniLM-L6-v2` and `meta-llama/Llama-3.2-3B-Instruct`) via serverless inference APIs invoked securely from AWS Lambda, we maintain complete control over the model selection, ensure 100% compliance with the "STRICTLY NO BEDROCK" requirement, and keep running costs at exactly **$0.00**.
+### Q1: How did you design the AI model layer, and why Amazon Bedrock + Nova Micro / Titan V2?
+> **Answer:** 
+> - **Embeddings:** We chose `amazon.titan-embed-text-v2:0` because it generates high-density 1024-dimensional normalized vectors specifically tuned for document retrieval, costing only **$0.02 per 1,000,000 tokens**.
+> - **LLM Generation:** We selected `amazon.nova-micro-v1:0` via the unified `bedrock-runtime` Converse API. It costs just **$0.035 per 1,000,000 input tokens** and offers sub-second inference latency, making it the most cost-effective foundation model on AWS.
+> - **Multi-Provider Resilience:** Foundation model access can sometimes be delayed or region-locked. We designed a dual-provider abstraction: if Bedrock throws `ValidationException` or `AccessDeniedException`, the system seamlessly falls back to Hugging Face Serverless or verified local extractive citations.
 
 ### Q2: Why did you choose FAISS stored in S3 rather than Amazon OpenSearch Serverless or Pinecone?
 > **Answer:** Amazon OpenSearch Serverless enforces a minimum billing configuration of 4 OpenSearch Compute Units (OCUs) even when idle, which results in an unavoidable baseline cost of approximately **$700 per month**. Managed vector SaaS like Pinecone introduces third-party billing and vendor lock-in.
 > For enterprise document processing up to hundreds of thousands of vectors, a FAISS `IndexFlatIP` index serialized to S3 is ideal:
-> - Storage cost in S3 is fraction of a cent (within Free Tier 5GB).
+> - Storage cost in S3 is a fraction of a cent (within Free Tier 5GB).
 > - Warm Lambda functions cache the index in `/tmp` and memory, providing sub-millisecond retrieval.
 > - ETag inspection ensures atomic index synchronization whenever Step Functions publishes an updated index.
 

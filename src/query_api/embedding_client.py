@@ -1,25 +1,40 @@
 """
 Embedding Client for Query API Lambda.
-Generates 384-dimensional normalized vector embeddings using Hugging Face Serverless API.
+Generates normalized vector embeddings using Amazon Bedrock Titan or Hugging Face.
 """
 
 import hashlib
+import json
 import logging
 import os
 import time
 from typing import Optional
 import numpy as np
 import requests
+import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-EMBEDDING_MODEL_ID = os.environ.get(
+DEFAULT_PROVIDER = os.environ.get("MODEL_PROVIDER", "bedrock").lower()
+BEDROCK_EMBEDDING_MODEL = os.environ.get(
+    "BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0"
+)
+BEDROCK_REGION = (
+    os.environ.get("BEDROCK_REGION")
+    or os.environ.get("AWS_REGION")
+    or os.environ.get("AWS_DEFAULT_REGION")
+    or "us-east-1"
+)
+BEDROCK_DEFAULT_DIM = 1024
+
+HF_EMBEDDING_MODEL_ID = os.environ.get(
     "EMBEDDING_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2"
 )
-EMBEDDING_DIM = 384
-HF_ROUTER_URL = f"https://router.huggingface.co/hf-inference/models/{EMBEDDING_MODEL_ID}"
-HF_LEGACY_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBEDDING_MODEL_ID}"
+HF_EMBEDDING_DIM = 384
+HF_ROUTER_URL = f"https://router.huggingface.co/hf-inference/models/{HF_EMBEDDING_MODEL_ID}"
+HF_LEGACY_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL_ID}"
 
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
@@ -28,7 +43,7 @@ def _normalize(vec: np.ndarray) -> np.ndarray:
     return vec / norm if norm > 0 else vec
 
 
-def _offline_fallback(text: str, dim: int = EMBEDDING_DIM) -> np.ndarray:
+def _offline_fallback(text: str, dim: int = BEDROCK_DEFAULT_DIM) -> np.ndarray:
     """
     Generate deterministic term-frequency hashed vector for offline queries.
     Matches feature hashing logic from indexing for high keyword cosine overlap.
@@ -53,60 +68,83 @@ def _offline_fallback(text: str, dim: int = EMBEDDING_DIM) -> np.ndarray:
     return _normalize(vec)
 
 
+def _get_bedrock_query_embedding(
+    text: str,
+    model_id: str = BEDROCK_EMBEDDING_MODEL,
+    dimensions: int = BEDROCK_DEFAULT_DIM,
+    region_name: Optional[str] = None,
+) -> np.ndarray:
+    """Invoke Bedrock Titan Embedding for query."""
+    region = region_name or BEDROCK_REGION
+    client = boto3.client("bedrock-runtime", region_name=region)
+
+    if "titan-embed-text-v2" in model_id:
+        payload = {
+            "inputText": text,
+            "dimensions": dimensions,
+            "normalize": True,
+        }
+    else:
+        payload = {"inputText": text}
+
+    response = client.invoke_model(
+        modelId=model_id,
+        body=json.dumps(payload),
+        contentType="application/json",
+        accept="application/json",
+    )
+    resp_body = json.loads(response["body"].read())
+    return _normalize(np.array(resp_body["embedding"], dtype=np.float32))
+
+
 def get_query_embedding(
     text: str,
+    provider: Optional[str] = None,
+    model_id: Optional[str] = None,
     token: Optional[str] = None,
-    max_retries: int = 2,
+    region_name: Optional[str] = None,
+    target_dim: Optional[int] = None,
 ) -> np.ndarray:
     """
-    Generate normalized 384-dimensional embedding for the user query.
-
-    Args:
-        text: Query string.
-        token: Optional Hugging Face API token.
-        max_retries: Retry count for cold starts.
-
-    Returns:
-        np.ndarray of shape (384,) float32.
+    Generate normalized embedding for user query.
+    Supports Amazon Bedrock Titan (default) and Hugging Face.
     """
     clean_text = text.replace("\n", " ").strip()
-    if not clean_text:
-        return np.zeros(EMBEDDING_DIM, dtype=np.float32)
+    chosen_provider = (provider or DEFAULT_PROVIDER).lower()
 
+    if chosen_provider == "bedrock":
+        try:
+            m_id = model_id or BEDROCK_EMBEDDING_MODEL
+            dim = target_dim or (1536 if "titan-embed-text-v1" in m_id else BEDROCK_DEFAULT_DIM)
+            return _get_bedrock_query_embedding(clean_text, model_id=m_id, dimensions=dim, region_name=region_name)
+        except Exception as e:
+            logger.warning(f"Bedrock query embedding error ({e}), trying fallback.")
+
+    # Hugging Face fallback
     api_token = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN", "")
     headers = {"Content-Type": "application/json"}
     if api_token:
         headers["Authorization"] = f"Bearer {api_token.strip()}"
 
-    for attempt in range(max_retries):
-        for url in [HF_ROUTER_URL, HF_LEGACY_URL]:
-            try:
-                res = requests.post(
-                    url,
-                    headers=headers,
-                    json={"inputs": clean_text, "options": {"wait_for_model": True}},
-                    timeout=15,
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    vec = np.array(data, dtype=np.float32)
-                    if vec.ndim == 2:
-                        vec = np.mean(vec, axis=0)
-                    elif vec.ndim > 2:
-                        vec = vec.flatten()[:EMBEDDING_DIM]
+    for url in [HF_ROUTER_URL, HF_LEGACY_URL]:
+        try:
+            res = requests.post(
+                url,
+                headers=headers,
+                json={"inputs": clean_text, "options": {"wait_for_model": True}},
+                timeout=15,
+            )
+            if res.status_code == 200:
+                data = res.json()
+                vec = np.array(data, dtype=np.float32)
+                if vec.ndim == 2:
+                    vec = np.mean(vec, axis=0)
+                elif vec.ndim > 2:
+                    vec = vec.flatten()[:HF_EMBEDDING_DIM]
+                if vec.shape[0] == HF_EMBEDDING_DIM:
+                    return _normalize(vec)
+        except Exception:
+            pass
 
-                    if vec.shape[0] == EMBEDDING_DIM:
-                        return _normalize(vec)
-
-                elif res.status_code == 503:
-                    time.sleep(2)
-                    continue
-                elif res.status_code in (401, 403):
-                    logger.warning("HF Token missing or invalid. Using offline vector.")
-                    return _offline_fallback(clean_text)
-
-            except Exception as e:
-                logger.warning(f"Embedding request error to {url}: {e}")
-
-    logger.warning("Embedding service unavailable, using local fallback.")
-    return _offline_fallback(clean_text)
+    dim = target_dim or (BEDROCK_DEFAULT_DIM if chosen_provider == "bedrock" else HF_EMBEDDING_DIM)
+    return _offline_fallback(clean_text, dim=dim)
