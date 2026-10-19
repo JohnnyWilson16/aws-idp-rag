@@ -93,7 +93,10 @@ if "messages" not in st.session_state:
     ]
 
 if "api_url" not in st.session_state:
-    st.session_state.api_url = os.environ.get("API_GATEWAY_URL", "http://localhost:3000")
+    st.session_state.api_url = os.environ.get(
+        "API_GATEWAY_URL",
+        "https://lq2w2n8jae.execute-api.us-east-1.amazonaws.com/dev",
+    )
 
 if "hf_token" not in st.session_state:
     st.session_state.hf_token = os.environ.get("HF_TOKEN", "")
