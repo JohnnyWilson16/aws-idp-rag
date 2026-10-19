@@ -248,6 +248,7 @@ def handle_process_and_index(event: Dict[str, Any]) -> Dict[str, Any]:
     # 4. Generate embeddings via Amazon Bedrock (or Hugging Face fallback)
     provider = event.get("provider") or os.environ.get("MODEL_PROVIDER", "bedrock").lower()
     model_id = event.get("embedding_model") or os.environ.get("BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
     chunk_texts = [f"Document: {c.get('doc_name', '')} Page: {c.get('page_number', 1)}\n{c['text']}" for c in chunks]
 
     if chunk_texts:
