@@ -127,23 +127,35 @@ def handle_start(event: Dict[str, Any]) -> Dict[str, Any]:
             ExpressionAttributeValues={":jid": job_id, ":u": _now_iso()},
         )
     except Exception as e:
-        logger.warning(f"Textract start failed ({e}). Falling back to native PDF extraction.")
-        pages_map = _extract_pages_fallback(s3_bucket, s3_key)
+        logger.warning(f"Textract start failed ({e}). Checking for existing OCR or falling back to PDF text.")
         extracted_s3_key = f"extracted/{doc_id}.json"
-        extracted_payload = {
-            "document_id": doc_id,
-            "filename": filename,
-            "page_count": len(pages_map),
-            "extracted_at": _now_iso(),
-            "pages": pages_map,
-            "source": "native_pdf_fallback",
-        }
-        s3_client.put_object(
-            Bucket=s3_bucket,
-            Key=extracted_s3_key,
-            Body=json.dumps(extracted_payload, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
+        has_existing_ocr = False
+        try:
+            existing_obj = s3_client.get_object(Bucket=s3_bucket, Key=extracted_s3_key)
+            existing_payload = json.loads(existing_obj["Body"].read().decode("utf-8"))
+            if existing_payload.get("pages") and any(p.get("full_text") for p in existing_payload["pages"].values()):
+                has_existing_ocr = True
+                logger.info(f"Existing rich OCR JSON detected for {doc_id}; preserving it.")
+        except ClientError:
+            pass
+
+        if not has_existing_ocr:
+            pages_map = _extract_pages_fallback(s3_bucket, s3_key)
+            extracted_payload = {
+                "document_id": doc_id,
+                "filename": filename,
+                "page_count": len(pages_map),
+                "extracted_at": _now_iso(),
+                "pages": pages_map,
+                "source": "native_pdf_fallback",
+            }
+            s3_client.put_object(
+                Bucket=s3_bucket,
+                Key=extracted_s3_key,
+                Body=json.dumps(extracted_payload, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+
         job_id = f"FALLBACK_{doc_id}"
         table.update_item(
             Key={"DocumentId": doc_id},
@@ -236,8 +248,7 @@ def handle_process_and_index(event: Dict[str, Any]) -> Dict[str, Any]:
     # 4. Generate embeddings via Amazon Bedrock (or Hugging Face fallback)
     provider = event.get("provider") or os.environ.get("MODEL_PROVIDER", "bedrock").lower()
     model_id = event.get("embedding_model") or os.environ.get("BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
-    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-    chunk_texts = [c["text"] for c in chunks]
+    chunk_texts = [f"Document: {c.get('doc_name', '')} Page: {c.get('page_number', 1)}\n{c['text']}" for c in chunks]
 
     if chunk_texts:
         logger.info(f"Generating embeddings for {len(chunk_texts)} chunks using provider: {provider} ({model_id})...")

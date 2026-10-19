@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from typing import Optional
 import numpy as np
@@ -45,25 +46,32 @@ def _normalize(vec: np.ndarray) -> np.ndarray:
 
 def _offline_fallback(text: str, dim: int = BEDROCK_DEFAULT_DIM) -> np.ndarray:
     """
-    Generate deterministic term-frequency hashed vector for offline queries.
+    Generate deterministic positive term-frequency hashed vector for offline queries.
     Matches feature hashing logic from indexing for high keyword cosine overlap.
     """
     vec = np.zeros(dim, dtype=np.float32)
-    words = [w.strip(".,;:!?()[]{}\"'") for w in text.lower().split()]
-    for w in words:
-        if not w:
-            continue
-        h = int(hashlib.md5(w.encode("utf-8")).hexdigest(), 16)
-        idx = h % dim
-        sign = 1.0 if ((h >> 16) & 1) else -1.0
-        vec[idx] += sign
+    stops = {
+        "what", "is", "the", "in", "and", "or", "to", "for", "of", "a", "an", "on",
+        "with", "at", "by", "from", "it", "this", "that", "these", "those", "how", "who"
+    }
+    raw = re.findall(r"[a-z0-9]+", text.lower())
+    words = [w for w in raw if w not in stops and len(w) > 1]
 
-    clean = text.lower().replace(" ", "")
+    for w in words:
+        h = int(hashlib.md5(w.encode("utf-8")).hexdigest(), 16)
+        vec[h % dim] += 2.0
+
+    # Bigrams for phrase preservation
+    for i in range(len(words) - 1):
+        bigram = f"{words[i]}_{words[i+1]}"
+        h = int(hashlib.md5(bigram.encode("utf-8")).hexdigest(), 16)
+        vec[h % dim] += 1.5
+
+    clean = "".join(words)
     for i in range(len(clean) - 2):
         gram = clean[i : i + 3]
         h = int(hashlib.md5(gram.encode("utf-8")).hexdigest(), 16)
-        idx = h % dim
-        vec[idx] += 0.3
+        vec[h % dim] += 0.2
 
     return _normalize(vec)
 
