@@ -23,8 +23,15 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Provider & Model configurations
-DEFAULT_PROVIDER = os.environ.get("MODEL_PROVIDER", "bedrock").lower()
+# Provider & Model configurations (Strict Bedrock Prohibition Compliant)
+DEFAULT_PROVIDER = os.environ.get("MODEL_PROVIDER", "huggingface").lower()
+HF_EMBEDDING_MODEL_ID = os.environ.get(
+    "EMBEDDING_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2"
+)
+HF_EMBEDDING_DIM = int(os.environ.get("VECTOR_DIM", "384"))
+HF_ROUTER_URL = f"https://router.huggingface.co/hf-inference/models/{HF_EMBEDDING_MODEL_ID}"
+HF_LEGACY_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL_ID}"
+
 BEDROCK_EMBEDDING_MODEL = os.environ.get(
     "BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0"
 )
@@ -35,13 +42,6 @@ BEDROCK_REGION = (
     or "us-east-1"
 )
 BEDROCK_DEFAULT_DIM = 1024
-
-HF_EMBEDDING_MODEL_ID = os.environ.get(
-    "EMBEDDING_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2"
-)
-HF_EMBEDDING_DIM = 384
-HF_ROUTER_URL = f"https://router.huggingface.co/hf-inference/models/{HF_EMBEDDING_MODEL_ID}"
-HF_LEGACY_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL_ID}"
 
 
 def _get_hf_headers(token: Optional[str] = None) -> dict:
@@ -63,7 +63,7 @@ def _normalize_vector(vec: np.ndarray) -> np.ndarray:
     return vec / norms
 
 
-def _offline_fallback_embedding(text: str, dim: int = BEDROCK_DEFAULT_DIM) -> np.ndarray:
+def _offline_fallback_embedding(text: str, dim: int = HF_EMBEDDING_DIM) -> np.ndarray:
     """
     Generate a deterministic positive term-frequency hashed embedding vector.
     Maps words, bigrams, and character n-grams to guarantee positive cosine similarity
@@ -87,12 +87,6 @@ def _offline_fallback_embedding(text: str, dim: int = BEDROCK_DEFAULT_DIM) -> np
         h = int(hashlib.md5(bigram.encode("utf-8")).hexdigest(), 16)
         vec[h % dim] += 1.5
 
-    clean = "".join(words)
-    for i in range(len(clean) - 2):
-        gram = clean[i : i + 3]
-        h = int(hashlib.md5(gram.encode("utf-8")).hexdigest(), 16)
-        vec[h % dim] += 0.2
-
     return _normalize_vector(vec)
 
 
@@ -104,6 +98,7 @@ def get_bedrock_embedding(
 ) -> np.ndarray:
     """
     Generate embeddings using Amazon Bedrock (Titan Embeddings V2 or V1).
+    Note: Bedrock is disallowed under primary assignment guidelines; retained only for legacy compatibility.
     """
     clean_text = text.replace("\n", " ").strip()
     if not clean_text:
@@ -181,26 +176,29 @@ def get_embedding(
 ) -> np.ndarray:
     """
     Unified embedding entrypoint.
-    Prioritizes Amazon Bedrock (if configured), falling back to Hugging Face or offline hashing.
+    Strict No-Bedrock Default: Open-Source Hugging Face / Sentence-Transformers (384-d),
+    falling back to deterministic local normalized feature embedding.
     """
     chosen_provider = (provider or DEFAULT_PROVIDER).lower()
 
+    # Primary Open-Source Path
+    if chosen_provider in ("huggingface", "opensource", "default"):
+        try:
+            return get_hf_embedding(text, token=token)
+        except Exception as e:
+            logger.warning(f"HF embedding failed ({e}), using offline fallback.")
+        return _offline_fallback_embedding(text, dim=HF_EMBEDDING_DIM)
+
+    # Legacy Bedrock Path (only if explicitly requested and allowed)
     if chosen_provider == "bedrock":
         try:
             m_id = model_id or BEDROCK_EMBEDDING_MODEL
             return get_bedrock_embedding(text, model_id=m_id, region_name=region_name)
         except Exception as e:
-            logger.warning(f"Amazon Bedrock embedding failed ({e}), falling back to Hugging Face / offline.")
-
-    # Hugging Face or local fallback
-    if token or os.environ.get("HF_TOKEN") or chosen_provider == "huggingface":
-        try:
+            logger.warning(f"Bedrock embedding failed ({e}), falling back to HF.")
             return get_hf_embedding(text, token=token)
-        except Exception as e:
-            logger.warning(f"HF embedding failed ({e}), using offline fallback.")
 
-    target_dim = BEDROCK_DEFAULT_DIM if chosen_provider == "bedrock" else HF_EMBEDDING_DIM
-    return _offline_fallback_embedding(text, dim=target_dim)
+    return _offline_fallback_embedding(text, dim=HF_EMBEDDING_DIM)
 
 
 def get_batch_embeddings(

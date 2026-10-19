@@ -94,6 +94,45 @@ class TestFAISSIndexer(unittest.TestCase):
         self.assertEqual(results[0]["chunk_id"], "c1")
         self.assertAlmostEqual(results[0]["score"], 1.0, places=2)
 
+    def test_dimension_adaptation(self):
+        """Verify that vectors adapt to target dimension without crashing FAISS search."""
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src/query_api")))
+        from embedding_client import _adapt_dimension
+
+        # 384-d vector adapted to 1024-d index
+        vec_384 = np.ones(384, dtype=np.float32)
+        adapted_1024 = _adapt_dimension(vec_384, target_dim=1024)
+        self.assertEqual(adapted_1024.shape[0], 1024)
+        self.assertAlmostEqual(np.linalg.norm(adapted_1024), 1.0, places=4)
+
+        # 1024-d vector adapted to 384-d index
+        vec_1024 = np.ones(1024, dtype=np.float32)
+        adapted_384 = _adapt_dimension(vec_1024, target_dim=384)
+        self.assertEqual(adapted_384.shape[0], 384)
+        self.assertAlmostEqual(np.linalg.norm(adapted_384), 1.0, places=4)
+
+    def test_hybrid_retrieval(self):
+        """Verify Dense (FAISS) + Sparse (Lexical) Hybrid Search with exact document matching."""
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src/query_api")))
+        from app import _retrieve_top_k
+
+        idx, meta = add_chunks_to_index(
+            self.index, self.metadata_list, self.chunks, self.embeddings
+        )
+
+        # Lexical keyword match on "Net 30 days" should rank invoice.pdf top
+        results = _retrieve_top_k(
+            index=idx,
+            metadata_list=meta,
+            query_vector=None,
+            query_text="What are the Net 30 payment terms?",
+            top_k=1,
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["doc_name"], "invoice.pdf")
+        self.assertEqual(results[0]["page_number"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
+

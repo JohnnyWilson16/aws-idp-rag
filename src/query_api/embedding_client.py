@@ -18,7 +18,14 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-DEFAULT_PROVIDER = os.environ.get("MODEL_PROVIDER", "bedrock").lower()
+DEFAULT_PROVIDER = os.environ.get("MODEL_PROVIDER", "huggingface").lower()
+HF_EMBEDDING_MODEL_ID = os.environ.get(
+    "EMBEDDING_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2"
+)
+HF_EMBEDDING_DIM = int(os.environ.get("VECTOR_DIM", "384"))
+HF_ROUTER_URL = f"https://router.huggingface.co/hf-inference/models/{HF_EMBEDDING_MODEL_ID}"
+HF_LEGACY_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL_ID}"
+
 BEDROCK_EMBEDDING_MODEL = os.environ.get(
     "BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0"
 )
@@ -30,13 +37,6 @@ BEDROCK_REGION = (
 )
 BEDROCK_DEFAULT_DIM = 1024
 
-HF_EMBEDDING_MODEL_ID = os.environ.get(
-    "EMBEDDING_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2"
-)
-HF_EMBEDDING_DIM = 384
-HF_ROUTER_URL = f"https://router.huggingface.co/hf-inference/models/{HF_EMBEDDING_MODEL_ID}"
-HF_LEGACY_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL_ID}"
-
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
     """L2-normalize vector to unit length."""
@@ -44,7 +44,24 @@ def _normalize(vec: np.ndarray) -> np.ndarray:
     return vec / norm if norm > 0 else vec
 
 
-def _offline_fallback(text: str, dim: int = BEDROCK_DEFAULT_DIM) -> np.ndarray:
+def _adapt_dimension(vec: np.ndarray, target_dim: Optional[int]) -> np.ndarray:
+    """
+    Guarantees mathematical dimension alignment with FAISS index.
+    If target_dim is provided and differs from vector length:
+    - Truncates if vec.shape[0] > target_dim
+    - Zero-pads if vec.shape[0] < target_dim
+    Then re-normalizes to preserve cosine similarity.
+    """
+    if not target_dim or vec.shape[0] == target_dim:
+        return _normalize(vec)
+    if vec.shape[0] > target_dim:
+        adapted = vec[:target_dim]
+    else:
+        adapted = np.pad(vec, (0, target_dim - vec.shape[0]), mode="constant")
+    return _normalize(adapted)
+
+
+def _offline_fallback(text: str, dim: int = HF_EMBEDDING_DIM) -> np.ndarray:
     """
     Generate deterministic positive term-frequency hashed vector for offline queries.
     Matches feature hashing logic from indexing for high keyword cosine overlap.
@@ -66,12 +83,6 @@ def _offline_fallback(text: str, dim: int = BEDROCK_DEFAULT_DIM) -> np.ndarray:
         bigram = f"{words[i]}_{words[i+1]}"
         h = int(hashlib.md5(bigram.encode("utf-8")).hexdigest(), 16)
         vec[h % dim] += 1.5
-
-    clean = "".join(words)
-    for i in range(len(clean) - 2):
-        gram = clean[i : i + 3]
-        h = int(hashlib.md5(gram.encode("utf-8")).hexdigest(), 16)
-        vec[h % dim] += 0.2
 
     return _normalize(vec)
 
@@ -115,44 +126,51 @@ def get_query_embedding(
 ) -> np.ndarray:
     """
     Generate normalized embedding for user query.
-    Supports Amazon Bedrock Titan (default) and Hugging Face.
+    Strict No-Bedrock Default: Open-Source Hugging Face / Sentence-Transformers (384-d),
+    with automatic vector dimension adaptation matching index.d.
     """
     clean_text = text.replace("\n", " ").strip()
     chosen_provider = (provider or DEFAULT_PROVIDER).lower()
+    expected_dim = target_dim or HF_EMBEDDING_DIM
 
+    # 1. Primary Open-Source Path (Hugging Face Serverless)
+    if chosen_provider in ("huggingface", "opensource", "default"):
+        api_token = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN", "")
+        if api_token:
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_token.strip()}",
+            }
+            try:
+                res = requests.post(
+                    HF_ROUTER_URL,
+                    headers=headers,
+                    json={"inputs": clean_text, "options": {"wait_for_model": True}},
+                    timeout=5,
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    vec = np.array(data, dtype=np.float32)
+                    if vec.ndim == 2:
+                        vec = np.mean(vec, axis=0)
+                    elif vec.ndim > 2:
+                        vec = vec.flatten()[:HF_EMBEDDING_DIM]
+                    if vec.shape[0] == HF_EMBEDDING_DIM:
+                        return _adapt_dimension(vec, target_dim=expected_dim)
+            except Exception as e:
+                logger.warning(f"HF query embedding call error: {e}")
+
+        return _adapt_dimension(_offline_fallback(clean_text, dim=HF_EMBEDDING_DIM), target_dim=expected_dim)
+
+    # 2. Legacy Bedrock Path (only if explicitly specified)
     if chosen_provider == "bedrock":
         try:
             m_id = model_id or BEDROCK_EMBEDDING_MODEL
             dim = target_dim or (1536 if "titan-embed-text-v1" in m_id else BEDROCK_DEFAULT_DIM)
-            return _get_bedrock_query_embedding(clean_text, model_id=m_id, dimensions=dim, region_name=region_name)
+            vec = _get_bedrock_query_embedding(clean_text, model_id=m_id, dimensions=dim, region_name=region_name)
+            return _adapt_dimension(vec, target_dim=expected_dim)
         except Exception as e:
             logger.warning(f"Bedrock query embedding error ({e}), trying fallback.")
+            return _adapt_dimension(_offline_fallback(clean_text, dim=HF_EMBEDDING_DIM), target_dim=expected_dim)
 
-    # Hugging Face fallback
-    api_token = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN", "")
-    headers = {"Content-Type": "application/json"}
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token.strip()}"
-
-    for url in [HF_ROUTER_URL, HF_LEGACY_URL]:
-        try:
-            res = requests.post(
-                url,
-                headers=headers,
-                json={"inputs": clean_text, "options": {"wait_for_model": True}},
-                timeout=15,
-            )
-            if res.status_code == 200:
-                data = res.json()
-                vec = np.array(data, dtype=np.float32)
-                if vec.ndim == 2:
-                    vec = np.mean(vec, axis=0)
-                elif vec.ndim > 2:
-                    vec = vec.flatten()[:HF_EMBEDDING_DIM]
-                if vec.shape[0] == HF_EMBEDDING_DIM:
-                    return _normalize(vec)
-        except Exception:
-            pass
-
-    dim = target_dim or (BEDROCK_DEFAULT_DIM if chosen_provider == "bedrock" else HF_EMBEDDING_DIM)
-    return _offline_fallback(clean_text, dim=dim)
+    return _adapt_dimension(_offline_fallback(clean_text, dim=expected_dim), target_dim=expected_dim)

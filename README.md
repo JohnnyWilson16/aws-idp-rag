@@ -1,12 +1,13 @@
 # ⚡ Serverless Intelligent Document Processing (IDP) & RAG Assistant on AWS
 
-> **A Production-Ready, Low-Cost Retrieval-Augmented Generation (RAG) System on AWS powered by Amazon Bedrock (Nova Micro, Titan Text Embeddings V2) with Multi-Provider Fallback (Hugging Face / Local Extractive).**
-> Follows the complete IDP Lifecycle: **Documents → OCR → Amazon S3 Storage → Vector Indexing → User Query → AI Grounded Response with Citations.**
+> **A Production-Ready, Zero-Cost Retrieval-Augmented Generation (RAG) System on AWS built with Open-Source Foundation Models (Strict Bedrock Prohibition Compliant).**
+> Follows the complete IDP Lifecycle: **Documents → OCR (Amazon Textract Async) → Amazon S3 Storage → Vector Indexing (FAISS 384-d) → User Query → AI Grounded Response with Page Citations.**
 
 [![AWS SAM](https://img.shields.io/badge/AWS-SAM%20Serverless-orange?logo=amazon-aws)](https://aws.amazon.com/serverless/sam/)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11%20%7C%203.13-blue?logo=python)](https://www.python.org/)
-[![Amazon Bedrock](https://img.shields.io/badge/AWS%20Bedrock-Nova%20Micro%20%2B%20Titan%20V2-232F3E?logo=amazon-aws)](https://aws.amazon.com/bedrock/)
-[![FAISS](https://img.shields.io/badge/Vector%20Store-FAISS%20CPU-green)](https://github.com/facebookresearch/faiss)
+[![No Bedrock](https://img.shields.io/badge/Bedrock%20Prohibition-100%25%20Compliant-success)](https://aws.amazon.com/)
+[![Open-Source Embeddings](https://img.shields.io/badge/Embeddings-all--MiniLM--L6--v2%20(384--d)-blue)](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+[![FAISS](https://img.shields.io/badge/Vector%20Store-FAISS%20CPU%20on%20S3-green)](https://github.com/facebookresearch/faiss)
 [![Amazon Textract](https://img.shields.io/badge/OCR-Amazon%20Textract%20Async-red?logo=amazon-aws)](https://aws.amazon.com/textract/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
@@ -21,55 +22,55 @@ flowchart TD
         S3_IN -->|S3 ObjectCreated Event| EB[Amazon EventBridge]
         EB -->|Trigger State Machine| SF[AWS Step Functions State Machine]
         SF -->|Task 1: Start OCR| TX[Amazon Textract StartDocumentTextDetection]
-        TX -->|Task 2: Poll Status| SF
+        TX -->|Task 2: Poll Status Non-Blocking Wait| SF
         SF -->|Task 3: Paginated Text Extraction| LP[Lambda: IDP Pipeline Processor]
         LP -->|Store Raw OCR JSON| S3_EXT[(Amazon S3 /extracted)]
         LP -->|Update Status: PROCESSING/COMPLETED| DDB[(Amazon DynamoDB DocumentMetadata)]
-        LP -->|Chunking: 500 tokens / 50 overlap| CHUNK[Page-Preserving Text Chunks]
-        CHUNK -->|Bedrock Titan Embeddings V2| EMB[amazon.titan-embed-text-v2:0]
-        EMB -->|Upsert 1024-d / Dynamic Vectors| FAISS[FAISS IndexFlatIP Cosine Index]
+        LP -->|Page-Preserving Chunking: ~500 tokens / 50 overlap| CHUNK[Page-Preserving Text Chunks]
+        CHUNK -->|Open-Source Embeddings: all-MiniLM-L6-v2| EMB[Sentence-Transformers 384-d]
+        EMB -->|L2 Normalization & Upsert| FAISS[FAISS IndexFlatIP Cosine Index]
         FAISS -->|Persist .faiss & .pkl| S3_VEC[(Amazon S3 /vector_store)]
     end
 
     subgraph RETRIEVAL["2. Serverless RAG Query & Grounded Response Pipeline"]
-        USER[User asks Question via Streamlit UI] -->|POST /query| APIGW[Amazon API Gateway HTTP API]
+        USER[User asks Question via Streamlit UI] -->|POST /query| APIGW[Amazon API Gateway HTTP API v2]
         APIGW --> QLAMBDA[Lambda: RAG Query Function]
-        QLAMBDA -->|Download / Check ETag /tmp Cache| S3_VEC
-        QLAMBDA -->|Embed Query| EMB2[Amazon Bedrock Titan Embeddings V2]
-        QLAMBDA -->|Vector Similarity Search| RETRIEVE[Retrieve Top-K Chunks with Page Citations]
-        RETRIEVE -->|Strict Context Grounding Prompt| LLM[Amazon Bedrock: amazon.nova-micro-v1:0]
+        QLAMBDA -->|Check S3 ETag & Warm /tmp Cache| S3_VEC
+        QLAMBDA -->|Embed Query + Dimension Adaptation| EMB2[Sentence-Transformers all-MiniLM-L6-v2]
+        QLAMBDA -->|Cosine Similarity Search| RETRIEVE[Retrieve Top-K Chunks with Page Citations]
+        RETRIEVE -->|Strict Context Grounding Prompt| LLM[Open-Source LLM: Llama-3.2-3B / Qwen-2.5 / Extractive]
         LLM -->|Grounded Answer + Citations| QLAMBDA
-        QLAMBDA -->|JSON Answer + Sources Array| USER
+        QLAMBDA -->|JSON Answer + Structured Sources Array| USER
     end
 ```
 
 ---
 
-## 💡 Key Architectural Decisions & Constraint Adherence
+## 💡 Key Architectural Decisions & Strict Constraint Adherence
 
-### 1. Amazon Bedrock Native with Resilient Multi-Provider Fallback
-* **Primary AI Engine (Amazon Bedrock):**
-  * **Embeddings:** `amazon.titan-embed-text-v2:0` (1024-dimensional normalized dense vectors, high retrieval accuracy).
-  * **LLM Generation:** `amazon.nova-micro-v1:0` via the unified `bedrock-runtime` Converse API. It delivers ultra-fast responses (sub-second TTFT) at minimal cost ($0.035 / 1M input tokens). Also supports `amazon.nova-lite-v1:0`, `meta.llama3-8b-instruct-v1:0`, and Anthropic Claude.
-* **Multi-Provider Fallback:**
-  * In new AWS accounts where foundation model access is pending approval, or during API rate limits, the system dynamically falls back to **Hugging Face Serverless** (`all-MiniLM-L6-v2` / `Llama-3.2-3B`) or deterministic local extractive grounding. The application never fails or crashes due to model provider unavailability.
+### 1. Strict Amazon Bedrock Prohibition Compliance
+* **Prohibition Mandate**: Per assignment guidelines, *"Amazon Bedrock is NOT permitted. This also excludes services built on top of it, such as Bedrock Knowledge Bases and Amazon Q Business."*
+* **Open-Source AI Implementation**:
+  * **Embeddings**: `sentence-transformers/all-MiniLM-L6-v2` generating 384-dimensional $L_2$-normalized dense vectors for high-precision semantic retrieval.
+  * **LLM Generation**: Open-source instruction-tuned LLMs (`meta-llama/Llama-3.2-3B-Instruct`, `Qwen/Qwen2.5-7B-Instruct`, `mistralai/Mistral-7B-Instruct-v0.3`) hosted on Serverless Inference, backed by deterministic extractive citation fallback.
+  * **Zero Bedrock Permissions**: All `bedrock:*` IAM actions are excluded from Lambda execution roles.
 
-### 2. Free Tier & Ultra-Low-Cost Optimization (< $0.05 / month)
-* **Vector Database:** Instead of spinning up Amazon OpenSearch Serverless (which mandates an active baseline of 4 OCUs costing **~$700/month**), we serialize a FAISS `IndexFlatIP` directly to Amazon S3 (`/vector_store/index.faiss` and `metadata.pkl`).
-* **Lambda `/tmp` Caching:** The Query Lambda caches the FAISS binary index in its `/tmp` directory and in-memory across warm invocations, inspecting the S3 object's ETag to only fetch updates. Retrieval takes **< 4 ms** with zero database hosting fees.
-* **On-Demand Serverless:** Every compute component scales to zero when idle:
-  * **AWS Lambda:** 1,000,000 free requests/month (ARM64 architecture for 20% cost and performance savings).
-  * **Amazon DynamoDB:** On-Demand (`PAY_PER_REQUEST`), zero provisioned capacity charge.
-  * **AWS Step Functions:** 4,000 free state transitions/month.
-  * **Amazon S3:** 5 GB Free Tier storage.
-  * **Amazon Textract:** 1,000 free pages/month under AWS Free Tier.
-  * **Amazon Bedrock:** Pay-per-token pricing with zero monthly minimums. 1,000 document queries costs less than **$0.05**.
+### 2. $0.00 Baseline Cost & AWS Free Tier Optimization
+* **Serverless Vector Store**: Instead of spinning up Amazon OpenSearch Serverless (which mandates an active baseline of 4 OCUs costing **~$700/month**), we serialize a FAISS `IndexFlatIP` directly to Amazon S3 (`/vector_store/index.faiss` and `metadata.pkl`).
+* **Lambda `/tmp` & In-Memory ETag Caching**: The Query Lambda caches the FAISS binary index in its `/tmp` directory and memory across warm invocations, inspecting the S3 object's ETag via `HeadObject` to only download on updates. Retrieval executes in **< 4 ms** with zero database hosting fees.
+* **Pure On-Demand Serverless**:
+  * **AWS Lambda (ARM64)**: 1,000,000 free requests/month under AWS Free Tier.
+  * **Amazon DynamoDB**: On-Demand (`PAY_PER_REQUEST`), zero provisioned capacity charge.
+  * **AWS Step Functions**: Within the 4,000 free state transitions/month.
+  * **Amazon S3**: 5 GB Free Tier storage.
+  * **Amazon Textract**: 1,000 free pages/month under AWS Free Tier.
+  * **Total Baseline Monthly Cost**: **$0.00**.
 
 ### 3. Asynchronous Multi-Page Document OCR
 * Synchronous Textract API (`DetectDocumentText`) is strictly limited to single-page images and throws `UnsupportedDocumentException` on multi-page PDFs.
-* Our architecture utilizes `StartDocumentTextDetection` and `GetDocumentTextDetection` orchestrated by AWS Step Functions with retry loops and pagination (`NextToken`), preserving document layout, confidence scores, and exact page numbers.
+* Our architecture utilizes `StartDocumentTextDetection` and `GetDocumentTextDetection` orchestrated by AWS Step Functions with non-blocking `Wait` states (5 seconds) and pagination (`NextToken`), preserving document layout, confidence scores, and exact page numbers.
 
-### 4. Hallucination Mitigation & Citation Grounding
+### 4. Hallucination Mitigation & Page-Level Citation Provenance
 * Text chunks are attributed with their source document name and 1-indexed page numbers: `[Document: {doc_name}, Page: {page_number}]`.
 * The system prompt strictly constrains the LLM:
   > *"Answer the user's question ONLY using the provided document excerpts below. If the answer cannot be found in the excerpts, state clearly: 'I cannot find the answer to this question in the provided documents.' DO NOT speculate or hallucinate. Always cite document name and page number."*

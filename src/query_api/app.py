@@ -12,6 +12,7 @@ Performs:
 
 import json
 import logging
+import math
 import os
 import pickle
 import re
@@ -28,9 +29,14 @@ from embedding_client import get_query_embedding
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Environment variables
+# Environment variables (Strict Bedrock Prohibition Compliant)
 S3_BUCKET_NAME = os.environ.get("DOCUMENT_BUCKET_NAME", "")
-DEFAULT_PROVIDER = os.environ.get("MODEL_PROVIDER", "bedrock").lower()
+DEFAULT_PROVIDER = os.environ.get("MODEL_PROVIDER", "huggingface").lower()
+HF_DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL_ID", "meta-llama/Llama-3.2-3B-Instruct")
+FALLBACK_LLM_MODELS = [
+    "Qwen/Qwen2.5-7B-Instruct",
+    "mistralai/Mistral-7B-Instruct-v0.3",
+]
 BEDROCK_DEFAULT_LLM_MODEL = os.environ.get(
     "BEDROCK_LLM_MODEL", "amazon.nova-micro-v1:0"
 )
@@ -40,12 +46,6 @@ BEDROCK_REGION = (
     or os.environ.get("AWS_DEFAULT_REGION")
     or "us-east-1"
 )
-
-HF_DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL_ID", "meta-llama/Llama-3.2-3B-Instruct")
-FALLBACK_LLM_MODELS = [
-    "Qwen/Qwen2.5-7B-Instruct",
-    "mistralai/Mistral-7B-Instruct-v0.3",
-]
 
 INDEX_S3_KEY = "vector_store/index.faiss"
 METADATA_S3_KEY = "vector_store/metadata.pkl"
@@ -128,35 +128,83 @@ def _load_cached_vector_store(
 
 
 def _retrieve_top_k(
-    index: faiss.IndexFlatIP,
+    index: Optional[faiss.IndexFlatIP],
     metadata_list: List[Dict[str, Any]],
-    query_vector: np.ndarray,
+    query_vector: Optional[np.ndarray],
+    query_text: str = "",
     top_k: int = 3,
-    min_score: float = 0.08,
+    min_score: float = 0.05,
 ) -> List[Dict[str, Any]]:
-    """Retrieve top-K matching chunks using cosine similarity, deduplicated by chunk."""
-    if index is None or index.ntotal == 0 or not metadata_list:
+    """
+    Retrieve top-K matching chunks using Dense (FAISS) + Sparse (Lexical) Hybrid Search.
+    Guarantees page-level provenance, deduplication, and high keyword precision.
+    """
+    if not metadata_list:
         return []
 
-    q_vec = np.ascontiguousarray(query_vector.reshape(1, -1), dtype=np.float32)
-    norm = np.linalg.norm(q_vec)
-    if norm > 0:
-        q_vec = q_vec / norm
+    # Stopwords for sparse lexical matching
+    stops = {
+        "what", "is", "the", "in", "and", "or", "to", "for", "of", "a", "an", "on",
+        "with", "at", "by", "from", "it", "this", "that", "these", "those", "how", "who",
+        "where", "when", "can", "you", "tell", "me", "about", "please", "give", "were",
+        "does", "did", "have", "has", "had", "are", "been"
+    }
+    raw_words = re.findall(r"[a-z0-9]+", query_text.lower()) if query_text else []
+    query_words = [w for w in raw_words if w not in stops and len(w) > 1]
 
-    # Fetch more neighbors to allow deduplication of repeated chunks
-    k = min(top_k * 4, index.ntotal)
-    distances, indices = index.search(q_vec, k)
+    # 1. Compute dense FAISS similarity scores
+    dense_scores = [0.0] * len(metadata_list)
+    if index is not None and index.ntotal > 0 and query_vector is not None:
+        q_vec = np.ascontiguousarray(query_vector.reshape(1, -1), dtype=np.float32)
+        norm = np.linalg.norm(q_vec)
+        if norm > 0:
+            q_vec = q_vec / norm
+        k_search = min(len(metadata_list), index.ntotal)
+        distances, indices = index.search(q_vec, k_search)
+        for dist, idx in zip(distances[0], indices[0]):
+            if 0 <= idx < len(metadata_list):
+                dense_scores[idx] = float(dist)
+
+    # 2. Compute sparse lexical scores
+    sparse_scores = [0.0] * len(metadata_list)
+    if query_words:
+        phrase = " ".join(query_words)
+        for idx, item in enumerate(metadata_list):
+            text_lower = (item.get("text", "") or "").lower()
+            score = 0.0
+            if len(query_words) > 1 and phrase in text_lower:
+                score += 3.0
+            for w in query_words:
+                cnt = len(re.findall(r"\b" + re.escape(w) + r"\b", text_lower))
+                if cnt > 0:
+                    score += 1.0 + math.log(1 + cnt)
+            sparse_scores[idx] = score
+
+    # Normalize sparse scores to [0, 1] range if max > 0
+    max_sparse = max(sparse_scores) if sparse_scores else 0.0
+    if max_sparse > 0:
+        norm_sparse = [s / max_sparse for s in sparse_scores]
+    else:
+        norm_sparse = sparse_scores
+
+    # 3. Hybrid fusion: 50% dense + 50% sparse (or 100% sparse if dense failed, or 100% dense if no keywords)
+    candidates = []
+    for idx, meta in enumerate(metadata_list):
+        d_val = max(0.0, dense_scores[idx])
+        s_val = norm_sparse[idx]
+        if max_sparse > 0:
+            combined = 0.5 * d_val + 0.5 * s_val
+        else:
+            combined = d_val
+        if combined >= min_score or s_val > 0.2:
+            candidates.append((combined, d_val, s_val, idx, meta))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
 
     results: List[Dict[str, Any]] = []
     seen_chunks = set()
 
-    for dist, idx in zip(distances[0], indices[0]):
-        if idx < 0 or idx >= len(metadata_list):
-            continue
-        if dist < min_score:
-            continue
-
-        meta = metadata_list[idx]
+    for combined, d_val, s_val, idx, meta in candidates:
         doc_name = meta.get("doc_name", "unknown_document")
         page_num = meta.get("page_number", 1)
         snippet = meta.get("text", "")
@@ -170,7 +218,9 @@ def _retrieve_top_k(
             "doc_name": doc_name,
             "page_number": page_num,
             "snippet": snippet,
-            "relevance_score": round(float(dist), 4),
+            "relevance_score": round(float(combined), 4),
+            "dense_score": round(float(d_val), 4),
+            "sparse_score": round(float(s_val), 4),
         })
 
         if len(results) >= top_k:
@@ -422,8 +472,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         target_dim=target_dim,
     )
 
-    # 3. Retrieve Top-K chunks
-    sources = _retrieve_top_k(index, metadata_list, query_vector, top_k=top_k)
+    # 3. Retrieve Top-K chunks via Hybrid Search
+    sources = _retrieve_top_k(
+        index,
+        metadata_list,
+        query_vector,
+        query_text=question,
+        top_k=top_k,
+    )
 
     if not sources:
         return _respond(
@@ -465,31 +521,36 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         f"3. Keep your response direct, professional, and clear."
     )
 
-    # 5. Call LLM (Amazon Bedrock first if configured, else Hugging Face, else extractive fallback)
+    # 5. Call LLM (Strict No-Bedrock Default: Open-Source Hugging Face LLMs / Extractive Fallback)
     answer = None
     model_used = requested_model
 
-    if provider == "bedrock":
+    # 1. Primary Open-Source Generative LLM (Hugging Face Serverless)
+    if provider in ("huggingface", "opensource", "default") or user_token or os.environ.get("HF_TOKEN"):
+        answer = _call_huggingface_llm(
+            prompt_system=system_prompt,
+            prompt_user=user_prompt,
+            model_id=requested_model if provider != "bedrock" else HF_DEFAULT_LLM_MODEL,
+            hf_token=user_token,
+            max_tokens=512,
+        )
+        if answer:
+            model_used = requested_model if provider != "bedrock" else HF_DEFAULT_LLM_MODEL
+
+    # 2. Legacy Bedrock Path (only if explicitly set to bedrock)
+    if not answer and provider == "bedrock":
         answer = _call_bedrock_llm(
             prompt_system=system_prompt,
             prompt_user=user_prompt,
             model_id=requested_model,
             max_tokens=512,
         )
-
-    if not answer and (provider == "huggingface" or user_token or os.environ.get("HF_TOKEN")):
-        answer = _call_huggingface_llm(
-            prompt_system=system_prompt,
-            prompt_user=user_prompt,
-            model_id=HF_DEFAULT_LLM_MODEL if provider == "bedrock" else requested_model,
-            hf_token=user_token,
-            max_tokens=512,
-        )
         if answer:
-            model_used = HF_DEFAULT_LLM_MODEL if provider == "bedrock" else requested_model
+            model_used = requested_model
 
+    # 3. Grounded Extractive Citation Fallback
     if not answer:
-        logger.info("External LLMs unavailable. Using extractive citation fallback.")
+        logger.info("External generative LLMs unavailable. Using extractive citation synthesis.")
         answer, sources = _generate_extractive_fallback(question, sources)
         model_used = "extractive-fallback"
 

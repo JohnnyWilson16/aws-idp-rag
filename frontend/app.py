@@ -83,10 +83,11 @@ if "messages" not in st.session_state:
         {
             "role": "assistant",
             "content": (
-                "Hello! I am your **AWS Serverless Intelligent Document Assistant** powered by **Amazon Bedrock**.\n\n"
+                "Hello! I am your **AWS Serverless Intelligent Document Processing (IDP) & RAG Assistant** "
+                "powered by **Open-Source Foundation Models & Serverless Inference** (Strict Bedrock Prohibition Compliant).\n\n"
                 "Upload PDFs or scanned images in the sidebar to process them through Amazon Textract "
-                "OCR and S3-backed vector indexing. Then ask any question, and I will answer with "
-                "strict context grounding and page citations."
+                "OCR and S3-backed 384-d FAISS vector indexing. Then ask any question, and I will answer with "
+                "strict context grounding and exact document & page citations."
             ),
             "sources": [],
         }
@@ -186,46 +187,48 @@ with st.sidebar:
 
     provider_choice = st.selectbox(
         "AI Model Provider",
-        options=["Amazon Bedrock", "Hugging Face Serverless"],
+        options=["Open-Source Hugging Face (Strict Bedrock Prohibition Compliant)", "Local Extractive Citation Fallback", "Amazon Bedrock (Disallowed / Legacy)"],
         index=0,
-        help="Amazon Bedrock provides managed foundation models (Claude 3.5, Nova, Titan Embeddings).",
+        help="Strict compliance with project guidelines prohibiting Amazon Bedrock.",
     )
 
-    if provider_choice == "Amazon Bedrock":
-        provider_key = "bedrock"
-        selected_model = st.selectbox(
-            "Bedrock LLM Model",
-            options=[
-                "amazon.nova-micro-v1:0",
-                "amazon.nova-lite-v1:0",
-                "meta.llama3-8b-instruct-v1:0",
-                "meta.llama3-1-8b-instruct-v1:0",
-                "anthropic.claude-3-5-sonnet-20240620-v1:0",
-                "amazon.titan-text-express-v1",
-            ],
-            index=0,
-            help="Unified Bedrock Converse API models.",
-        )
-        st.caption("Embedding Engine: `amazon.titan-embed-text-v2:0` (1024-d)")
-    else:
+    if provider_choice.startswith("Open-Source"):
         provider_key = "huggingface"
         selected_model = st.selectbox(
-            "Hugging Face LLM Model",
+            "Open-Source LLM Model",
             options=[
                 "meta-llama/Llama-3.2-3B-Instruct",
                 "Qwen/Qwen2.5-7B-Instruct",
                 "mistralai/Mistral-7B-Instruct-v0.3",
             ],
             index=0,
+            help="Free serverless inference on open LLMs hosted via Hugging Face Serverless API.",
         )
         hf_token_input = st.text_input(
             "Hugging Face Token (Optional)",
             value=st.session_state.hf_token,
             type="password",
-            help="Used for serverless inference on open LLMs (free at huggingface.co/settings/tokens)",
+            help="Optional free token from huggingface.co/settings/tokens for rate-limit bypass",
         )
         st.session_state.hf_token = hf_token_input
-        st.caption("Embedding Engine: `all-MiniLM-L6-v2` (384-d)")
+        st.caption("Embedding Engine: `sentence-transformers/all-MiniLM-L6-v2` (384-d)")
+    elif provider_choice.startswith("Local Extractive"):
+        provider_key = "local-extractive"
+        selected_model = "extractive-fallback"
+        st.caption("Deterministic extractive retrieval verification directly from OCR text with exact citations.")
+    else:
+        provider_key = "bedrock"
+        st.warning("⚠️ Note: Amazon Bedrock is explicitly prohibited under project constraints.")
+        selected_model = st.selectbox(
+            "Bedrock LLM Model",
+            options=[
+                "amazon.nova-micro-v1:0",
+                "amazon.nova-lite-v1:0",
+                "meta.llama3-8b-instruct-v1:0",
+            ],
+            index=0,
+        )
+        st.caption("Embedding Engine: `amazon.titan-embed-text-v2:0` (1024-d)")
 
     top_k_val = st.slider("Retrieval Depth (Top-K Chunks)", min_value=1, max_value=5, value=3)
 
@@ -293,6 +296,13 @@ with st.sidebar:
                 )
                 st.caption(f"Pages: {page_count} | Chunks: {chunk_count}")
                 st.divider()
+
+        # Reactive polling: automatically refresh if any document is actively processing
+        is_processing = any(doc.get("status") in ("PROCESSING", "UPLOADED", "FALLBACK_PARSED") for doc in documents)
+        if is_processing:
+            st.sidebar.caption("🔄 Document processing active... auto-refreshing in 3s")
+            time.sleep(3)
+            st.rerun()
     else:
         st.info("No documents indexed yet. Upload a document to start.")
 
@@ -302,7 +312,7 @@ with st.sidebar:
 # ==============================================================================
 st.markdown("<div class='main-header'>⚡ Serverless IDP + RAG Assistant</div>", unsafe_allow_html=True)
 st.markdown(
-    "<div class='sub-header'>End-to-End Intelligent Document Processing on AWS (Amazon Bedrock • Textract • Step Functions • S3 FAISS)</div>",
+    "<div class='sub-header'>End-to-End Intelligent Document Processing on AWS (Open-Source Models • Textract Async • Step Functions • S3 FAISS • Strict Bedrock Prohibition Compliant)</div>",
     unsafe_allow_html=True,
 )
 

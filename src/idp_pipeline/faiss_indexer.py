@@ -23,7 +23,7 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-VECTOR_DIM = int(os.environ.get("VECTOR_DIM", "1024"))
+VECTOR_DIM = int(os.environ.get("VECTOR_DIM", "384"))
 INDEX_S3_KEY = "vector_store/index.faiss"
 METADATA_S3_KEY = "vector_store/metadata.pkl"
 
