@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import pickle
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import faiss
@@ -131,8 +132,9 @@ def _retrieve_top_k(
     metadata_list: List[Dict[str, Any]],
     query_vector: np.ndarray,
     top_k: int = 3,
+    min_score: float = 0.08,
 ) -> List[Dict[str, Any]]:
-    """Retrieve top-K matching chunks using cosine similarity."""
+    """Retrieve top-K matching chunks using cosine similarity, deduplicated by chunk."""
     if index is None or index.ntotal == 0 or not metadata_list:
         return []
 
@@ -141,20 +143,38 @@ def _retrieve_top_k(
     if norm > 0:
         q_vec = q_vec / norm
 
-    k = min(top_k, index.ntotal)
+    # Fetch more neighbors to allow deduplication of repeated chunks
+    k = min(top_k * 4, index.ntotal)
     distances, indices = index.search(q_vec, k)
 
     results: List[Dict[str, Any]] = []
+    seen_chunks = set()
+
     for dist, idx in zip(distances[0], indices[0]):
         if idx < 0 or idx >= len(metadata_list):
             continue
+        if dist < min_score:
+            continue
+
         meta = metadata_list[idx]
+        doc_name = meta.get("doc_name", "unknown_document")
+        page_num = meta.get("page_number", 1)
+        snippet = meta.get("text", "")
+
+        chunk_key = meta.get("chunk_id") or f"{doc_name}_p{page_num}"
+        if chunk_key in seen_chunks:
+            continue
+        seen_chunks.add(chunk_key)
+
         results.append({
-            "doc_name": meta.get("doc_name", "unknown_document"),
-            "page_number": meta.get("page_number", 1),
-            "snippet": meta.get("text", ""),
+            "doc_name": doc_name,
+            "page_number": page_num,
+            "snippet": snippet,
             "relevance_score": round(float(dist), 4),
         })
+
+        if len(results) >= top_k:
+            break
 
     return results
 
@@ -269,13 +289,35 @@ def _call_huggingface_llm(
     return None
 
 
-def _generate_extractive_fallback(question: str, sources: List[Dict[str, Any]]) -> str:
+def _generate_extractive_fallback(question: str, sources: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Extractive synthesis fallback when external LLM APIs are offline or token is absent.
-    Provides verifiable, hallucination-free answers directly from matched excerpts.
+    Checks keyword overlap to prevent answering unrelated or generic questions with random excerpts.
     """
     if not sources:
-        return "I cannot find the answer to this question in the provided documents."
+        return "I cannot find any relevant excerpts in the provided documents to answer this question.", []
+
+    # Extract meaningful query keywords (excluding stop words)
+    stops = {
+        "what", "is", "the", "in", "and", "or", "to", "for", "of", "a", "an", "on",
+        "with", "at", "by", "from", "it", "this", "that", "these", "those", "how", "who",
+        "where", "when", "can", "you", "tell", "me", "about", "please", "give"
+    }
+    raw_words = re.findall(r"[a-z0-9]+", question.lower())
+    query_words = [w for w in raw_words if w not in stops and len(w) > 2]
+
+    # Verify lexical relevance against retrieved snippets
+    combined_snippets = " ".join([s.get("snippet", "").lower() for s in sources])
+    matched_keywords = [w for w in query_words if w in combined_snippets]
+
+    top_score = sources[0].get("relevance_score", 0.0)
+    # If query has keywords but NONE match any snippet, refuse
+    if query_words and not matched_keywords:
+        return (
+            f"I cannot find information about '{question}' in the uploaded documents. "
+            "Please ask a question specific to the contents of your uploaded documents.",
+            [],
+        )
 
     lines = [
         "Based on the relevant excerpts retrieved from the processed documents:",
@@ -293,7 +335,7 @@ def _generate_extractive_fallback(question: str, sources: List[Dict[str, Any]]) 
     lines.append(
         "*(Note: Generated via extractive retrieval verification based directly on OCR output.)*"
     )
-    return "\n".join(lines)
+    return "\n".join(lines), sources
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -320,6 +362,32 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     question = body.get("question", "").strip()
     if not question:
         return _respond(400, {"error": "Field 'question' is required"})
+
+    # 0. Conversational Intent Guardrail for greetings, chitchat, and identity
+    greetings = {
+        "hello", "hi", "hey", "namaste", "good morning", "good afternoon",
+        "good evening", "greetings", "howdy", "hola", "sup", "yo",
+        "how are you", "who are you", "what can you do", "help",
+        "thanks", "thank you", "bye", "goodbye"
+    }
+    clean_q = re.sub(r"[^\w\s]", "", question.strip().lower())
+    if clean_q in greetings:
+        return _respond(
+            200,
+            {
+                "question": question,
+                "answer": (
+                    "Hello! I am your Intelligent Document Processing (IDP) Assistant on AWS. "
+                    "You can ask me specific questions about your uploaded documents (such as invoices, "
+                    "bank statements, rental agreements, receipts, and reports), and I will retrieve the exact answers "
+                    "with document and page citations."
+                ),
+                "sources": [],
+                "chunks_retrieved": 0,
+                "model_used": "conversational-guardrail",
+                "provider": (body.get("provider") or DEFAULT_PROVIDER).lower(),
+            },
+        )
 
     top_k = min(int(body.get("top_k", 3)), 10)
     user_token = body.get("hf_token")
@@ -422,7 +490,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     if not answer:
         logger.info("External LLMs unavailable. Using extractive citation fallback.")
-        answer = _generate_extractive_fallback(question, sources)
+        answer, sources = _generate_extractive_fallback(question, sources)
         model_used = "extractive-fallback"
 
     return _respond(
