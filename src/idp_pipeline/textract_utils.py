@@ -207,14 +207,20 @@ def chunk_document_pages(
     """
     chunks: List[Dict[str, Any]] = []
 
-    for page_num, page_data in pages_map.items():
-        lines = page_data.get("lines", [])
-        if not lines:
-            continue
+    for page_num_key, page_data in pages_map.items():
+        try:
+            page_num = int(page_num_key)
+        except (ValueError, TypeError):
+            page_num = 1
 
-        # Reconstruct structured paragraphs based on double line breaks or line grouping
-        page_text = page_data.get("full_text", "")
-        if not page_text.strip():
+        if isinstance(page_data, str):
+            page_text = page_data
+            lines = [{"text": l} for l in page_text.splitlines() if l.strip()]
+        else:
+            lines = page_data.get("lines", [])
+            page_text = page_data.get("full_text", "")
+
+        if not lines or not page_text.strip():
             continue
 
         # If page text is within chunk size limit, keep as single chunk

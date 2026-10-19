@@ -52,9 +52,36 @@ def _sanitize_doc_id(s3_key: str) -> str:
     return safe_name.replace(" ", "_")
 
 
+def _extract_pages_fallback(s3_bucket: str, s3_key: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Fallback parser using pypdf if Textract is unavailable or unsubscribed.
+    """
+    import io
+    from pypdf import PdfReader
+
+    logger.info(f"Using pypdf fallback extraction for s3://{s3_bucket}/{s3_key}")
+    obj = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+    pdf_bytes = io.BytesIO(obj["Body"].read())
+    reader = PdfReader(pdf_bytes)
+    pages_map: Dict[str, Dict[str, Any]] = {}
+    for idx, page in enumerate(reader.pages):
+        page_num = str(idx + 1)
+        text = page.extract_text() or ""
+        lines = [{"text": l, "confidence": 100.0} for l in text.splitlines() if l.strip()]
+        pages_map[page_num] = {
+            "page_number": idx + 1,
+            "lines": lines,
+            "full_text": text.strip(),
+            "line_count": len(lines),
+            "confidence_avg": 100.0,
+        }
+    return pages_map
+
+
 def handle_start(event: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Step 1: Initialize DynamoDB record with PROCESSING status and start Textract async job.
+    Step 1: Receive document upload event, register in DynamoDB,
+    and start asynchronous Textract OCR (with pypdf fallback).
     """
     s3_bucket = event.get("s3_bucket")
     s3_key = event.get("s3_key")
@@ -90,15 +117,40 @@ def handle_start(event: Dict[str, Any]) -> Dict[str, Any]:
         }
     )
 
-    # Start asynchronous Textract job
-    job_id = start_document_text_detection(s3_bucket, s3_key)
+    # Attempt asynchronous Textract job, falling back to pypdf on permission/subscription failure
+    job_id = None
+    try:
+        job_id = start_document_text_detection(s3_bucket, s3_key)
+        table.update_item(
+            Key={"DocumentId": doc_id},
+            UpdateExpression="SET job_id = :jid, updated_at = :u",
+            ExpressionAttributeValues={":jid": job_id, ":u": _now_iso()},
+        )
+    except Exception as e:
+        logger.warning(f"Textract start failed ({e}). Falling back to native PDF extraction.")
+        pages_map = _extract_pages_fallback(s3_bucket, s3_key)
+        extracted_s3_key = f"extracted/{doc_id}.json"
+        extracted_payload = {
+            "document_id": doc_id,
+            "filename": filename,
+            "page_count": len(pages_map),
+            "extracted_at": _now_iso(),
+            "pages": pages_map,
+            "source": "native_pdf_fallback",
+        }
+        s3_client.put_object(
+            Bucket=s3_bucket,
+            Key=extracted_s3_key,
+            Body=json.dumps(extracted_payload, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        job_id = f"FALLBACK_{doc_id}"
+        table.update_item(
+            Key={"DocumentId": doc_id},
+            UpdateExpression="SET job_id = :jid, stage = :st, updated_at = :u",
+            ExpressionAttributeValues={":jid": job_id, ":st": "FALLBACK_PARSED", ":u": _now_iso()},
+        )
 
-    # Update DynamoDB with JobId
-    table.update_item(
-        Key={"DocumentId": doc_id},
-        UpdateExpression="SET job_id = :jid, updated_at = :u",
-        ExpressionAttributeValues={":jid": job_id, ":u": _now_iso()},
-    )
 
     return {
         "document_id": doc_id,
@@ -118,6 +170,12 @@ def handle_check_status(event: Dict[str, Any]) -> Dict[str, Any]:
     if not job_id:
         raise ValueError("Missing job_id in check_status event")
 
+    if job_id.startswith("FALLBACK_"):
+        result = dict(event)
+        result["job_status"] = "SUCCEEDED"
+        result["status_message"] = "Extracted via resilient fallback PDF parser"
+        return result
+
     status_data = check_document_text_detection_status(job_id)
     result = dict(event)
     result["job_status"] = status_data["job_status"]
@@ -135,29 +193,36 @@ def handle_process_and_index(event: Dict[str, Any]) -> Dict[str, Any]:
     s3_bucket = event["s3_bucket"]
     filename = event.get("filename", doc_id)
 
-    logger.info(f"Processing Textract output for document {doc_id} (job {job_id})")
+    logger.info(f"Processing output for document {doc_id} (job {job_id})")
 
-    # 1. Fetch all Textract blocks with pagination
-    blocks = fetch_all_textract_blocks(job_id)
-    pages_map = parse_textract_blocks(blocks)
-    page_count = len(pages_map)
-
-    # 2. Store raw extracted OCR output as JSON in S3
     extracted_s3_key = f"extracted/{doc_id}.json"
-    extracted_payload = {
-        "document_id": doc_id,
-        "filename": filename,
-        "page_count": page_count,
-        "extracted_at": _now_iso(),
-        "pages": pages_map,
-    }
-    s3_client.put_object(
-        Bucket=s3_bucket,
-        Key=extracted_s3_key,
-        Body=json.dumps(extracted_payload, indent=2).encode("utf-8"),
-        ContentType="application/json",
-    )
-    logger.info(f"Saved raw extracted OCR to s3://{s3_bucket}/{extracted_s3_key}")
+    if job_id.startswith("FALLBACK_"):
+        logger.info(f"Loading pre-extracted fallback pages from s3://{s3_bucket}/{extracted_s3_key}")
+        obj = s3_client.get_object(Bucket=s3_bucket, Key=extracted_s3_key)
+        payload = json.loads(obj["Body"].read().decode("utf-8"))
+        pages_map = payload.get("pages", {})
+        page_count = len(pages_map)
+    else:
+        # 1. Fetch all Textract blocks with pagination
+        blocks = fetch_all_textract_blocks(job_id)
+        pages_map = parse_textract_blocks(blocks)
+        page_count = len(pages_map)
+
+        # 2. Store raw extracted OCR output as JSON in S3
+        extracted_payload = {
+            "document_id": doc_id,
+            "filename": filename,
+            "page_count": page_count,
+            "extracted_at": _now_iso(),
+            "pages": pages_map,
+        }
+        s3_client.put_object(
+            Bucket=s3_bucket,
+            Key=extracted_s3_key,
+            Body=json.dumps(extracted_payload, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        logger.info(f"Saved raw extracted OCR to s3://{s3_bucket}/{extracted_s3_key}")
 
     # 3. Chunk text across pages preserving metadata
     chunks = chunk_document_pages(
@@ -232,21 +297,30 @@ def handle_failure(event: Dict[str, Any]) -> Dict[str, Any]:
     """
     Step 4: Record error details in DynamoDB and mark FAILED.
     """
-    doc_id = event.get("document_id") or "UNKNOWN_DOC"
+    exec_input = event.get("execution_input", {})
+    doc_id = (
+        event.get("document_id")
+        or exec_input.get("document_id")
+        or (exec_input.get("detail", {}).get("object", {}).get("key") and _sanitize_doc_id(exec_input["detail"]["object"]["key"]))
+        or "UNKNOWN_DOC"
+    )
     error = event.get("error") or event.get("Cause") or "Unspecified processing error"
 
     logger.error(f"Processing failed for document {doc_id}: {error}")
 
-    table.update_item(
-        Key={"DocumentId": doc_id},
-        UpdateExpression="SET #st = :st, error_message = :err, updated_at = :u",
-        ExpressionAttributeNames={"#st": "status"},
-        ExpressionAttributeValues={
-            ":st": "FAILED",
-            ":err": str(error),
-            ":u": _now_iso(),
-        },
-    )
+    try:
+        table.update_item(
+            Key={"DocumentId": doc_id},
+            UpdateExpression="SET #st = :st, error_message = :err, updated_at = :u",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={
+                ":st": "FAILED",
+                ":err": str(error),
+                ":u": _now_iso(),
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Could not record failure in DynamoDB: {e}")
 
     return {
         "document_id": doc_id,

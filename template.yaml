@@ -439,7 +439,7 @@ Resources:
             Resource: !GetAtt IdpPipelineFunction.Arn
             Parameters:
               action: handle_failure
-              document_id.$: "$.document_id"
+              execution_input.$: "$"
               error.$: "$.error"
             End: true
 
