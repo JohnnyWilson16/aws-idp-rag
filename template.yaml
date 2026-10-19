@@ -13,9 +13,19 @@ Parameters:
 
   ModelProvider:
     Type: String
-    Default: huggingface
-    AllowedValues: [huggingface, opensource, local-extractive]
-    Description: Primary AI model provider (Open-Source Hugging Face Serverless / Local Extractive).
+    Default: bedrock
+    AllowedValues: [bedrock, huggingface, opensource, local-extractive]
+    Description: Primary AI model provider (Amazon Bedrock or Open-Source Hugging Face).
+
+  BedrockLLMModel:
+    Type: String
+    Default: amazon.nova-micro-v1:0
+    Description: Default Amazon Bedrock foundation model ID.
+
+  BedrockEmbeddingModel:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: Default Amazon Bedrock Titan embedding model ID.
 
   DefaultLLMModel:
     Type: String
@@ -52,6 +62,8 @@ Globals:
         DYNAMODB_TABLE_NAME: !Ref DocumentMetadataTable
         DOCUMENT_BUCKET_NAME: !Ref DocumentStorageBucket
         MODEL_PROVIDER: !Ref ModelProvider
+        BEDROCK_LLM_MODEL: !Ref BedrockLLMModel
+        BEDROCK_EMBEDDING_MODEL: !Ref BedrockEmbeddingModel
         LLM_MODEL_ID: !Ref DefaultLLMModel
         EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
         VECTOR_DIM: !Ref VectorDim
@@ -145,6 +157,13 @@ Resources:
                   - textract:GetDocumentTextDetection
                   - textract:DetectDocumentText
                 Resource: "*"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:Converse
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: "*"
 
   QueryApiLambdaRole:
     Type: AWS::IAM::Role
@@ -171,6 +190,13 @@ Resources:
                 Resource:
                   - !GetAtt DocumentStorageBucket.Arn
                   - !Sub "${DocumentStorageBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:Converse
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: "*"
 
   DocumentApiLambdaRole:
     Type: AWS::IAM::Role

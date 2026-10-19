@@ -84,9 +84,9 @@ if "messages" not in st.session_state:
             "role": "assistant",
             "content": (
                 "Hello! I am your **AWS Serverless Intelligent Document Processing (IDP) & RAG Assistant** "
-                "powered by **Open-Source Foundation Models & Serverless Inference** (Strict Bedrock Prohibition Compliant).\n\n"
+                "powered by **Amazon Bedrock & Open-Source Foundation Models**.\n\n"
                 "Upload PDFs or scanned images in the sidebar to process them through Amazon Textract "
-                "OCR and S3-backed 384-d FAISS vector indexing. Then ask any question, and I will answer with "
+                "OCR and S3-backed FAISS vector indexing. Then ask any question, and I will answer with "
                 "strict context grounding and exact document & page citations."
             ),
             "sources": [],
@@ -187,12 +187,30 @@ with st.sidebar:
 
     provider_choice = st.selectbox(
         "AI Model Provider",
-        options=["Open-Source Hugging Face (Strict Bedrock Prohibition Compliant)", "Local Extractive Citation Fallback", "Amazon Bedrock (Disallowed / Legacy)"],
+        options=[
+            "Amazon Bedrock (AWS Native Serverless Foundation Models)",
+            "Open-Source Hugging Face Serverless",
+            "Local Extractive Citation Verification",
+        ],
         index=0,
-        help="Strict compliance with project guidelines prohibiting Amazon Bedrock.",
+        help="Select between Amazon Bedrock (Nova Micro, Claude 3 Haiku, Llama 3) and Open-Source models.",
     )
 
-    if provider_choice.startswith("Open-Source"):
+    if provider_choice.startswith("Amazon Bedrock"):
+        provider_key = "bedrock"
+        selected_model = st.selectbox(
+            "Amazon Bedrock Foundation Model",
+            options=[
+                "amazon.nova-micro-v1:0",
+                "amazon.nova-lite-v1:0",
+                "anthropic.claude-3-haiku-20240307-v1:0",
+                "meta.llama3-8b-instruct-v1:0",
+            ],
+            index=0,
+            help="High-speed, cost-effective serverless inference on AWS Bedrock.",
+        )
+        st.caption("Embedding Engine: `amazon.titan-embed-text-v2:0` (1024-d / adaptive) with S3 FAISS index")
+    elif provider_choice.startswith("Open-Source"):
         provider_key = "huggingface"
         selected_model = st.selectbox(
             "Open-Source LLM Model",
@@ -212,23 +230,10 @@ with st.sidebar:
         )
         st.session_state.hf_token = hf_token_input
         st.caption("Embedding Engine: `sentence-transformers/all-MiniLM-L6-v2` (384-d)")
-    elif provider_choice.startswith("Local Extractive"):
+    else:
         provider_key = "local-extractive"
         selected_model = "extractive-fallback"
         st.caption("Deterministic extractive retrieval verification directly from OCR text with exact citations.")
-    else:
-        provider_key = "bedrock"
-        st.warning("⚠️ Note: Amazon Bedrock is explicitly prohibited under project constraints.")
-        selected_model = st.selectbox(
-            "Bedrock LLM Model",
-            options=[
-                "amazon.nova-micro-v1:0",
-                "amazon.nova-lite-v1:0",
-                "meta.llama3-8b-instruct-v1:0",
-            ],
-            index=0,
-        )
-        st.caption("Embedding Engine: `amazon.titan-embed-text-v2:0` (1024-d)")
 
     top_k_val = st.slider("Retrieval Depth (Top-K Chunks)", min_value=1, max_value=5, value=3)
 

@@ -525,8 +525,21 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     answer = None
     model_used = requested_model
 
-    # 1. Primary Open-Source Generative LLM (Hugging Face Serverless)
-    if provider in ("huggingface", "opensource", "default") or user_token or os.environ.get("HF_TOKEN"):
+    # 1. Amazon Bedrock Foundation Models (AWS Native)
+    if provider == "bedrock":
+        answer = _call_bedrock_llm(
+            prompt_system=system_prompt,
+            prompt_user=user_prompt,
+            model_id=requested_model,
+            max_tokens=512,
+        )
+        if answer:
+            model_used = requested_model
+        else:
+            logger.info("Bedrock unavailable or unauthorized. Falling back to open-source / extractive pipeline.")
+
+    # 2. Open-Source Generative LLMs (Hugging Face Serverless)
+    if not answer and (provider in ("huggingface", "opensource", "default") or user_token or os.environ.get("HF_TOKEN")):
         answer = _call_huggingface_llm(
             prompt_system=system_prompt,
             prompt_user=user_prompt,
@@ -537,20 +550,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if answer:
             model_used = requested_model if provider != "bedrock" else HF_DEFAULT_LLM_MODEL
 
-    # 2. Legacy Bedrock Path (only if explicitly set to bedrock)
-    if not answer and provider == "bedrock":
-        answer = _call_bedrock_llm(
-            prompt_system=system_prompt,
-            prompt_user=user_prompt,
-            model_id=requested_model,
-            max_tokens=512,
-        )
-        if answer:
-            model_used = requested_model
-
     # 3. Grounded Extractive Citation Fallback
     if not answer:
-        logger.info("External generative LLMs unavailable. Using extractive citation synthesis.")
+        logger.info("Generative LLMs unavailable. Using extractive citation synthesis.")
         answer, sources = _generate_extractive_fallback(question, sources)
         model_used = "extractive-fallback"
 
