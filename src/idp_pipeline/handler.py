@@ -16,6 +16,7 @@ import os
 import urllib.parse
 from typing import Any, Dict
 import boto3
+from botocore.exceptions import ClientError
 
 from textract_utils import (
     start_document_text_detection,
