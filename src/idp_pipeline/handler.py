@@ -39,6 +39,7 @@ DYNAMODB_TABLE_NAME = os.environ.get("DYNAMODB_TABLE_NAME", "DocumentMetadataTab
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 s3_client = boto3.client("s3")
+rekognition_client = boto3.client("rekognition")
 
 
 def _now_iso() -> str:
@@ -53,29 +54,121 @@ def _sanitize_doc_id(s3_key: str) -> str:
     return safe_name.replace(" ", "_")
 
 
+def _extract_images_from_page(page) -> list:
+    """
+    Extract raw image bytes from a PDF page.
+    Attempts pypdf page.images (Pillow) and falls back to direct XObject stream reading
+    to ensure 100% resilience without external C-library crashes.
+    """
+    img_list = []
+    # 1. Try pypdf page.images
+    try:
+        if hasattr(page, "images"):
+            for img in page.images:
+                if hasattr(img, "data") and img.data:
+                    img_list.append(img.data)
+    except Exception as e:
+        logger.debug(f"pypdf page.images failed: {e}")
+
+    # 2. Direct XObject extraction fallback
+    if not img_list:
+        try:
+            resources = page.get("/Resources")
+            if resources:
+                xobjs = resources.get("/XObject")
+                if xobjs:
+                    xobj_dict = xobjs.get_object() if hasattr(xobjs, "get_object") else xobjs
+                    if isinstance(xobj_dict, dict):
+                        for name, obj in xobj_dict.items():
+                            subtype = obj.get("/Subtype") if hasattr(obj, "get") else None
+                            if subtype == "/Image":
+                                data = obj.get_data() if hasattr(obj, "get_data") else None
+                                if data and len(data) > 100:
+                                    img_list.append(data)
+        except Exception as e:
+            logger.debug(f"Direct XObject image extraction failed: {e}")
+
+    return img_list
+
+
 def _extract_pages_fallback(s3_bucket: str, s3_key: str) -> Dict[str, Dict[str, Any]]:
     """
-    Fallback parser using pypdf if Textract is unavailable or unsubscribed.
+    Fallback parser using pypdf and Amazon Rekognition OCR
+    when Textract is unavailable or unsubscribed.
+    Handles both PDFs and direct image uploads (.png, .jpg, .jpeg, etc.).
     """
     import io
     from pypdf import PdfReader
 
-    logger.info(f"Using pypdf fallback extraction for s3://{s3_bucket}/{s3_key}")
+    logger.info(f"Extracting pages for s3://{s3_bucket}/{s3_key} using fallback OCR engine")
     obj = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
-    pdf_bytes = io.BytesIO(obj["Body"].read())
-    reader = PdfReader(pdf_bytes)
+    raw_bytes = obj["Body"].read()
+    key_lower = s3_key.lower()
     pages_map: Dict[str, Dict[str, Any]] = {}
-    for idx, page in enumerate(reader.pages):
-        page_num = str(idx + 1)
-        text = page.extract_text() or ""
-        lines = [{"text": l, "confidence": 100.0} for l in text.splitlines() if l.strip()]
-        pages_map[page_num] = {
-            "page_number": idx + 1,
+
+    # 1. Direct Image Files (.png, .jpg, .jpeg, .tiff, .bmp, .webp)
+    if key_lower.endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp")):
+        lines = []
+        try:
+            res = rekognition_client.detect_text(Image={"Bytes": raw_bytes})
+            for d in res.get("TextDetections", []):
+                if d.get("Type") == "LINE":
+                    lines.append({
+                        "text": d["DetectedText"],
+                        "confidence": float(d.get("Confidence", 95.0)),
+                    })
+        except Exception as e:
+            logger.error(f"Rekognition image OCR failed for {s3_key}: {e}")
+
+        full_text = "\n".join([l["text"] for l in lines])
+        pages_map["1"] = {
+            "page_number": 1,
             "lines": lines,
-            "full_text": text.strip(),
+            "full_text": full_text.strip(),
             "line_count": len(lines),
-            "confidence_avg": 100.0,
+            "confidence_avg": sum(l["confidence"] for l in lines) / len(lines) if lines else 0.0,
         }
+        return pages_map
+
+    # 2. PDF Documents
+    try:
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        for idx, page in enumerate(reader.pages):
+            page_num = str(idx + 1)
+            text = page.extract_text() or ""
+            lines = [{"text": l, "confidence": 100.0} for l in text.splitlines() if l.strip()]
+
+            # If digital text is missing or sparse (< 20 chars), run Rekognition OCR on embedded image(s)
+            if len(text.strip()) < 20:
+                logger.info(f"Page {page_num} of {s3_key} has sparse digital text; running Rekognition OCR on page images")
+                img_bytes_list = _extract_images_from_page(page)
+                ocr_lines = []
+                for img_data in img_bytes_list:
+                    try:
+                        res = rekognition_client.detect_text(Image={"Bytes": img_data})
+                        for d in res.get("TextDetections", []):
+                            if d.get("Type") == "LINE":
+                                ocr_lines.append({
+                                    "text": d["DetectedText"],
+                                    "confidence": float(d.get("Confidence", 95.0)),
+                                })
+                    except Exception as e:
+                        logger.warning(f"Rekognition failed for page {page_num} image: {e}")
+
+                if ocr_lines:
+                    lines = ocr_lines
+                    text = "\n".join([l["text"] for l in lines])
+
+            pages_map[page_num] = {
+                "page_number": idx + 1,
+                "lines": lines,
+                "full_text": text.strip(),
+                "line_count": len(lines),
+                "confidence_avg": sum(l["confidence"] for l in lines) / len(lines) if lines else 0.0,
+            }
+    except Exception as e:
+        logger.error(f"Failed to parse PDF {s3_key}: {e}")
+
     return pages_map
 
 
@@ -272,38 +365,63 @@ def handle_process_and_index(event: Dict[str, Any]) -> Dict[str, Any]:
 
         # 6. Save updated index and metadata back to S3
         save_index_to_s3(index, metadata_list, s3_bucket)
+
+        # 7. Update DynamoDB status to COMPLETED
+        now = _now_iso()
+        table.update_item(
+            Key={"DocumentId": doc_id},
+            UpdateExpression=(
+                "SET #st = :st, stage = :sg, page_count = :pc, chunk_count = :cc, "
+                "extracted_s3_key = :ek, vector_store_s3_key = :vk, updated_at = :u"
+            ),
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={
+                ":st": "COMPLETED",
+                ":sg": "INDEXED",
+                ":pc": page_count,
+                ":cc": chunk_count,
+                ":ek": extracted_s3_key,
+                ":vk": "vector_store/index.faiss",
+                ":u": now,
+            },
+        )
+
+        logger.info(f"Document {doc_id} successfully indexed! Pages: {page_count}, Chunks: {chunk_count}")
+
+        return {
+            "document_id": doc_id,
+            "status": "COMPLETED",
+            "page_count": page_count,
+            "chunk_count": chunk_count,
+            "extracted_s3_key": extracted_s3_key,
+        }
     else:
-        logger.warning(f"No text extracted from document {doc_id}")
-
-    # 7. Update DynamoDB status to COMPLETED
-    now = _now_iso()
-    table.update_item(
-        Key={"DocumentId": doc_id},
-        UpdateExpression=(
-            "SET #st = :st, stage = :sg, page_count = :pc, chunk_count = :cc, "
-            "extracted_s3_key = :ek, vector_store_s3_key = :vk, updated_at = :u"
-        ),
-        ExpressionAttributeNames={"#st": "status"},
-        ExpressionAttributeValues={
-            ":st": "COMPLETED",
-            ":sg": "INDEXED",
-            ":pc": page_count,
-            ":cc": chunk_count,
-            ":ek": extracted_s3_key,
-            ":vk": "vector_store/index.faiss",
-            ":u": now,
-        },
-    )
-
-    logger.info(f"Document {doc_id} successfully indexed! Pages: {page_count}, Chunks: {chunk_count}")
-
-    return {
-        "document_id": doc_id,
-        "status": "COMPLETED",
-        "page_count": page_count,
-        "chunk_count": chunk_count,
-        "extracted_s3_key": extracted_s3_key,
-    }
+        logger.warning(f"No text extracted from document {doc_id}. Marking document as FAILED.")
+        now = _now_iso()
+        error_msg = "No readable text or characters could be detected in the document."
+        table.update_item(
+            Key={"DocumentId": doc_id},
+            UpdateExpression=(
+                "SET #st = :st, stage = :sg, page_count = :pc, chunk_count = :cc, "
+                "error_message = :err, updated_at = :u"
+            ),
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={
+                ":st": "FAILED",
+                ":sg": "NO_TEXT_EXTRACTED",
+                ":pc": page_count,
+                ":cc": 0,
+                ":err": error_msg,
+                ":u": now,
+            },
+        )
+        return {
+            "document_id": doc_id,
+            "status": "FAILED",
+            "page_count": page_count,
+            "chunk_count": 0,
+            "error_message": error_msg,
+        }
 
 
 def handle_failure(event: Dict[str, Any]) -> Dict[str, Any]:

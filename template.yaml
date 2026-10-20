@@ -156,6 +156,7 @@ Resources:
                   - textract:StartDocumentTextDetection
                   - textract:GetDocumentTextDetection
                   - textract:DetectDocumentText
+                  - rekognition:DetectText
                 Resource: "*"
               - Effect: Allow
                 Action:

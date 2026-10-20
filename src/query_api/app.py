@@ -142,15 +142,24 @@ def _retrieve_top_k(
     if not metadata_list:
         return []
 
-    # Stopwords for sparse lexical matching
+    # Comprehensive Stopwords & Query Intent Vocabulary
     stops = {
         "what", "is", "the", "in", "and", "or", "to", "for", "of", "a", "an", "on",
         "with", "at", "by", "from", "it", "this", "that", "these", "those", "how", "who",
-        "where", "when", "can", "you", "tell", "me", "about", "please", "give", "were",
-        "does", "did", "have", "has", "had", "are", "been"
+        "where", "when", "which", "whom", "whose", "why", "will", "would", "shall", "should",
+        "could", "may", "might", "must", "do", "did", "does", "done", "doing", "be", "being",
+        "been", "was", "were", "there", "their", "they", "them", "my", "your", "his", "her",
+        "its", "our", "can", "you", "tell", "me", "about", "please", "give", "have", "has", "had"
     }
+    inquiry_words = {
+        "located", "location", "situated", "based", "find", "found", "show", "give",
+        "tell", "details", "detail", "information", "info", "list", "state", "stated",
+        "describe", "described", "provide", "provided", "mention", "mentioned"
+    }
+
     raw_words = re.findall(r"[a-z0-9]+", query_text.lower()) if query_text else []
     query_words = [w for w in raw_words if w not in stops and len(w) > 1]
+    subject_words = [w for w in query_words if w not in inquiry_words]
 
     # 1. Compute dense FAISS similarity scores
     dense_scores = [0.0] * len(metadata_list)
@@ -165,46 +174,83 @@ def _retrieve_top_k(
             if 0 <= idx < len(metadata_list):
                 dense_scores[idx] = float(dist)
 
-    # 2. Compute sparse lexical scores
+    # 2. Compute sparse lexical scores with subject-entity weighting
     sparse_scores = [0.0] * len(metadata_list)
-    if query_words:
-        phrase = " ".join(query_words)
-        for idx, item in enumerate(metadata_list):
-            text_lower = (item.get("text", "") or "").lower()
+    phrase = " ".join(subject_words) if subject_words else " ".join(query_words)
+
+    for idx, item in enumerate(metadata_list):
+        text_lower = (item.get("text", "") or "").lower()
+        doc_lower = (item.get("doc_name", "") or "").lower()
+        score = 0.0
+
+        # Exact phrase match in body
+        if len(subject_words) > 1 and phrase in text_lower:
+            score += 5.0
+
+        # Subject words in text
+        matched_subject_in_text = 0
+        for w in subject_words:
+            cnt = len(re.findall(r"\b" + re.escape(w) + r"\b", text_lower))
+            if cnt > 0:
+                score += 2.0 + math.log(1 + cnt)
+                matched_subject_in_text += 1
+
+        # Subject words in doc_name
+        matched_subject_in_doc = 0
+        for w in subject_words:
+            if re.search(r"\b" + re.escape(w) + r"\b", doc_lower):
+                score += 1.5
+                matched_subject_in_doc += 1
+
+        # Inquiry words in text (give minor weight only if subject words matched)
+        if matched_subject_in_text > 0 or matched_subject_in_doc > 0:
+            for w in inquiry_words:
+                if w in raw_words:
+                    cnt = len(re.findall(r"\b" + re.escape(w) + r"\b", text_lower))
+                    if cnt > 0:
+                        score += 0.5
+
+        # Strict subject penalty: if subject words exist in query, candidate must match at least one
+        if subject_words and (matched_subject_in_text == 0 and matched_subject_in_doc == 0):
             score = 0.0
-            if len(query_words) > 1 and phrase in text_lower:
-                score += 3.0
-            for w in query_words:
-                cnt = len(re.findall(r"\b" + re.escape(w) + r"\b", text_lower))
-                if cnt > 0:
-                    score += 1.0 + math.log(1 + cnt)
-            sparse_scores[idx] = score
+
+        sparse_scores[idx] = score
 
     # Normalize sparse scores to [0, 1] range if max > 0
     max_sparse = max(sparse_scores) if sparse_scores else 0.0
-    if max_sparse > 0:
-        norm_sparse = [s / max_sparse for s in sparse_scores]
-    else:
-        norm_sparse = sparse_scores
+    norm_sparse = [s / max_sparse if max_sparse > 0 else 0.0 for s in sparse_scores]
 
-    # 3. Hybrid fusion: 50% dense + 50% sparse (or 100% sparse if dense failed, or 100% dense if no keywords)
+    # 3. Hybrid fusion and candidate filtering
     candidates = []
     for idx, meta in enumerate(metadata_list):
         d_val = max(0.0, dense_scores[idx])
         s_val = norm_sparse[idx]
-        if max_sparse > 0:
-            combined = 0.5 * d_val + 0.5 * s_val
-        else:
-            combined = d_val
-        if combined >= min_score or s_val > 0.2:
-            candidates.append((combined, d_val, s_val, idx, meta))
+
+        # Filter out chunks with 0 sparse score unless dense score is exceptionally high
+        if subject_words and s_val == 0.0 and d_val < 0.65:
+            continue
+
+        # Ignore tiny uninformative chunks (< 30 chars) if they don't have top sparse match
+        text_len = len((meta.get("text") or "").strip())
+        if text_len < 30 and s_val < 0.8:
+            continue
+
+        combined = 0.4 * d_val + 0.6 * s_val if max_sparse > 0 else d_val
+        candidates.append((combined, d_val, s_val, idx, meta))
 
     candidates.sort(key=lambda x: x[0], reverse=True)
+    if not candidates:
+        return []
+
+    top_score = candidates[0][0]
+    min_cutoff = max(0.20, top_score * 0.55)
 
     results: List[Dict[str, Any]] = []
     seen_chunks = set()
 
     for combined, d_val, s_val, idx, meta in candidates:
+        if combined < min_cutoff:
+            break
         doc_name = meta.get("doc_name", "unknown_document")
         page_num = meta.get("page_number", 1)
         snippet = meta.get("text", "")
@@ -342,27 +388,48 @@ def _call_huggingface_llm(
 def _generate_extractive_fallback(question: str, sources: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Extractive synthesis fallback when external LLM APIs are offline or token is absent.
-    Checks keyword overlap to prevent answering unrelated or generic questions with random excerpts.
+    Performs per-source relevance verification to eliminate false-positive excerpts.
     """
     if not sources:
         return "I cannot find any relevant excerpts in the provided documents to answer this question.", []
 
-    # Extract meaningful query keywords (excluding stop words)
     stops = {
         "what", "is", "the", "in", "and", "or", "to", "for", "of", "a", "an", "on",
         "with", "at", "by", "from", "it", "this", "that", "these", "those", "how", "who",
-        "where", "when", "can", "you", "tell", "me", "about", "please", "give"
+        "where", "when", "can", "you", "tell", "me", "about", "please", "give", "were",
+        "does", "did", "have", "has", "had", "are", "been"
     }
+    inquiry_words = {
+        "located", "location", "situated", "based", "find", "found", "show", "give",
+        "tell", "details", "detail", "information", "info", "list", "state", "stated",
+        "describe", "described", "provide", "provided", "mention", "mentioned"
+    }
+
     raw_words = re.findall(r"[a-z0-9]+", question.lower())
-    query_words = [w for w in raw_words if w not in stops and len(w) > 2]
+    query_words = [w for w in raw_words if w not in stops and len(w) > 1]
+    subject_words = [w for w in query_words if w not in inquiry_words]
 
-    # Verify lexical relevance against retrieved snippets
-    combined_snippets = " ".join([s.get("snippet", "").lower() for s in sources])
-    matched_keywords = [w for w in query_words if w in combined_snippets]
+    # Verify each source individually
+    valid_sources = []
+    for s in sources:
+        snip = (s.get("snippet") or s.get("text", "")).lower()
+        doc = (s.get("doc_name") or "").lower()
+        score = s.get("relevance_score", 0.0)
 
-    top_score = sources[0].get("relevance_score", 0.0)
-    # If query has keywords but NONE match any snippet, refuse
-    if query_words and not matched_keywords:
+        # Check if snippet or doc name matches subject words
+        matched_subjects = [w for w in subject_words if re.search(r"\b" + re.escape(w) + r"\b", snip) or re.search(r"\b" + re.escape(w) + r"\b", doc)]
+        matched_inquiry = [w for w in inquiry_words if re.search(r"\b" + re.escape(w) + r"\b", snip)]
+
+        if subject_words:
+            # If query has subject words, this source must match at least one or have high score
+            if matched_subjects or score >= 0.65:
+                valid_sources.append(s)
+        else:
+            # If query only has inquiry words, check any word match or score
+            if matched_inquiry or score >= 0.35:
+                valid_sources.append(s)
+
+    if not valid_sources:
         return (
             f"I cannot find information about '{question}' in the uploaded documents. "
             "Please ask a question specific to the contents of your uploaded documents.",
@@ -373,19 +440,21 @@ def _generate_extractive_fallback(question: str, sources: List[Dict[str, Any]]) 
         "Based on the relevant excerpts retrieved from the processed documents:",
         "",
     ]
-    for idx, s in enumerate(sources, start=1):
+    for s in valid_sources:
         doc_name = s.get("doc_name", "document")
         page_num = s.get("page_number", 1)
         raw_text = s.get("snippet") or s.get("text", "")
         lines.append(f"• **[Document: {doc_name}, Page: {page_num}]**:")
-        clean_snip = " ".join(raw_text.split()[:80])
-        lines.append(f'  "{clean_snip}..."')
+        words = raw_text.split()
+        clean_snip = " ".join(words[:150])
+        trailing = "..." if len(words) > 150 else ""
+        lines.append(f'  "{clean_snip}{trailing}"')
         lines.append("")
 
     lines.append(
         "*(Note: Generated via extractive retrieval verification based directly on OCR output.)*"
     )
-    return "\n".join(lines), sources
+    return "\n".join(lines), valid_sources
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
