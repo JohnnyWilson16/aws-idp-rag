@@ -201,15 +201,15 @@ with st.sidebar:
         selected_model = st.selectbox(
             "Amazon Bedrock Foundation Model",
             options=[
-                "amazon.nova-micro-v1:0",
-                "amazon.nova-lite-v1:0",
-                "anthropic.claude-3-haiku-20240307-v1:0",
-                "meta.llama3-8b-instruct-v1:0",
+                "us.amazon.nova-micro-v1:0",
+                "us.amazon.nova-lite-v1:0",
+                "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+                "us.meta.llama3-2-3b-instruct-v1:0",
             ],
             index=0,
             help="High-speed, cost-effective serverless inference on AWS Bedrock.",
         )
-        st.caption("Embedding Engine: `amazon.titan-embed-text-v2:0` (1024-d / adaptive) with S3 FAISS index")
+        st.caption("Embedding Engine: `amazon.titan-embed-text-v2:0` (1024-d / adaptive) with grounded semantic synthesis")
     elif provider_choice.startswith("Open-Source"):
         provider_key = "huggingface"
         selected_model = st.selectbox(
