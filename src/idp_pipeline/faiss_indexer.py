@@ -1,213 +1,186 @@
 """
-FAISS Vector Index Manager for S3-backed Serverless Storage and Retrieval.
+S3-backed FAISS vector store.
 
-Features:
-- Inner Product (cosine similarity on L2-normalized vectors) FAISS Flat index.
-- Serialization of binary index and chunk metadata to Amazon S3.
-- In-memory / /tmp caching for low-latency AWS Lambda execution.
-- Vector upsert, deduplication, and Top-K similarity search.
+The whole store (FAISS index + chunk metadata + embedding manifest) lives in ONE
+S3 object, so a reader never sees an index and metadata from different writes.
+Writers use S3 conditional writes (If-Match / If-None-Match) and retry on
+conflict, so two documents indexed at the same time cannot overwrite each other.
+
+The object is an .npz file loaded with allow_pickle=False: no pickle is ever
+deserialized from S3.
 """
 
 import io
 import json
 import logging
-import os
-import pickle
-import tempfile
+import random
+import time
 from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
 import faiss
 import numpy as np
-import boto3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-VECTOR_DIM = int(os.environ.get("VECTOR_DIM", "384"))
-INDEX_S3_KEY = "vector_store/index.faiss"
-METADATA_S3_KEY = "vector_store/metadata.pkl"
+STORE_S3_KEY = "vector_store/store.npz"
+MAX_WRITE_ATTEMPTS = 6
+
+Manifest = Dict[str, Any]  # {"embedding_provider", "embedding_model", "dim"}
 
 
-def get_s3_client(region_name: Optional[str] = None) -> Any:
-    """Instantiate or reuse boto3 S3 client."""
-    return boto3.client("s3", region_name=region_name)
+class ManifestMismatchError(ValueError):
+    """The store was built with a different embedding model than the new vectors."""
 
 
-def create_empty_index(dim: int = VECTOR_DIM) -> faiss.IndexFlatIP:
-    """Create a new FAISS Flat Inner Product index for dense vectors."""
+def create_empty_index(dim: int) -> faiss.IndexFlatIP:
+    """Exact inner-product index. With L2-normalized vectors, IP equals cosine similarity."""
     return faiss.IndexFlatIP(dim)
 
 
-def load_index_from_s3(
-    bucket_name: str,
-    s3_client: Optional[Any] = None,
-    local_cache_dir: str = "/tmp",
-) -> Tuple[faiss.IndexFlatIP, List[Dict[str, Any]]]:
-    """
-    Download and deserialize the FAISS index and metadata from S3.
-    If the index does not exist yet in S3, initializes a new empty index and metadata list.
+def _normalize_rows(vectors: np.ndarray) -> np.ndarray:
+    vectors = np.ascontiguousarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return vectors / norms
 
-    Args:
-        bucket_name: Target S3 bucket name.
-        s3_client: Optional boto3 S3 client.
-        local_cache_dir: Local path (e.g. /tmp in Lambda) for temporary storage.
 
-    Returns:
-        Tuple of (faiss_index, metadata_list)
-    """
-    s3 = s3_client or get_s3_client()
-    local_index_path = os.path.join(local_cache_dir, "index.faiss")
-    local_meta_path = os.path.join(local_cache_dir, "metadata.pkl")
+def serialize_store(index: faiss.Index, metadata: List[Dict[str, Any]], manifest: Manifest) -> bytes:
+    buf = io.BytesIO()
+    np.savez(
+        buf,
+        index=faiss.serialize_index(index),
+        metadata=np.frombuffer(json.dumps(metadata).encode("utf-8"), dtype=np.uint8),
+        manifest=np.frombuffer(json.dumps(manifest).encode("utf-8"), dtype=np.uint8),
+    )
+    return buf.getvalue()
 
+
+def deserialize_store(data: bytes) -> Tuple[faiss.Index, List[Dict[str, Any]], Manifest]:
+    with np.load(io.BytesIO(data), allow_pickle=False) as npz:
+        index = faiss.deserialize_index(npz["index"])
+        metadata = json.loads(npz["metadata"].tobytes().decode("utf-8"))
+        manifest = json.loads(npz["manifest"].tobytes().decode("utf-8"))
+    if index.ntotal != len(metadata):
+        raise ValueError(f"Corrupt store: {index.ntotal} vectors but {len(metadata)} metadata rows")
+    return index, metadata, manifest
+
+
+def load_store(
+    bucket_name: str, s3_client: Optional[Any] = None
+) -> Tuple[Optional[faiss.Index], List[Dict[str, Any]], Optional[Manifest], Optional[str]]:
+    """Return (index, metadata, manifest, etag). All None/empty if the store does not exist yet."""
+    s3 = s3_client or boto3.client("s3")
     try:
-        logger.info(f"Checking for existing vector store in s3://{bucket_name}/{INDEX_S3_KEY}")
-        s3.download_file(bucket_name, INDEX_S3_KEY, local_index_path)
-        s3.download_file(bucket_name, METADATA_S3_KEY, local_meta_path)
-
-        index = faiss.read_index(local_index_path)
-        with open(local_meta_path, "rb") as f:
-            metadata_list = pickle.load(f)
-
-        logger.info(f"Loaded existing index with {index.ntotal} vectors and {len(metadata_list)} metadata entries")
-        return index, metadata_list
-
+        obj = s3.get_object(Bucket=bucket_name, Key=STORE_S3_KEY)
     except ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code")
-        if error_code in ("404", "NoSuchKey", "NotFound"):
-            logger.info("No existing index found in S3. Creating a new empty index.")
-            return create_empty_index(VECTOR_DIM), []
-        logger.error(f"Failed to load index from S3: {e}")
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            return None, [], None, None
         raise
-
-
-def save_index_to_s3(
-    index: faiss.IndexFlatIP,
-    metadata_list: List[Dict[str, Any]],
-    bucket_name: str,
-    s3_client: Optional[Any] = None,
-    local_cache_dir: str = "/tmp",
-) -> None:
-    """
-    Serialize the FAISS index and metadata and upload them to Amazon S3.
-
-    Args:
-        index: FAISS index object.
-        metadata_list: List of metadata dictionaries corresponding to vectors.
-        bucket_name: Target S3 bucket name.
-        s3_client: Optional boto3 S3 client.
-        local_cache_dir: Local path for temporary files.
-    """
-    s3 = s3_client or get_s3_client()
-    local_index_path = os.path.join(local_cache_dir, "index.faiss")
-    local_meta_path = os.path.join(local_cache_dir, "metadata.pkl")
-
-    # Write binary index and pickle metadata
-    faiss.write_index(index, local_index_path)
-    with open(local_meta_path, "wb") as f:
-        pickle.dump(metadata_list, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    logger.info(f"Uploading updated index ({index.ntotal} vectors) to s3://{bucket_name}/{INDEX_S3_KEY}")
-    s3.upload_file(local_index_path, bucket_name, INDEX_S3_KEY)
-    s3.upload_file(local_meta_path, bucket_name, METADATA_S3_KEY)
-    logger.info("Vector store successfully saved to S3.")
+    index, metadata, manifest = deserialize_store(obj["Body"].read())
+    return index, metadata, manifest, obj["ETag"]
 
 
 def add_chunks_to_index(
-    index: faiss.IndexFlatIP,
+    index: Optional[faiss.Index],
     metadata_list: List[Dict[str, Any]],
     new_chunks: List[Dict[str, Any]],
     new_embeddings: np.ndarray,
-) -> Tuple[faiss.IndexFlatIP, List[Dict[str, Any]]]:
+    replace_doc: Optional[str] = None,
+) -> Tuple[faiss.Index, List[Dict[str, Any]]]:
     """
-    Add newly generated embeddings and metadata to an existing or fresh index.
-
-    Args:
-        index: Target FAISS index.
-        metadata_list: Existing metadata list.
-        new_chunks: List of chunk dictionaries.
-        new_embeddings: np.ndarray of shape (N, 384) float32.
-
-    Returns:
-        Tuple of updated (index, metadata_list)
+    Add vectors and metadata. If replace_doc is set, first drop every existing
+    chunk of that document so a re-upload does not create duplicates.
     """
-    if len(new_chunks) == 0:
-        return index, metadata_list
+    vectors = _normalize_rows(new_embeddings)
+    if len(new_chunks) != vectors.shape[0]:
+        raise ValueError(f"{len(new_chunks)} chunks but {vectors.shape[0]} embeddings")
+    dim = vectors.shape[1]
 
-    # Ensure float32 format
-    embeddings = np.ascontiguousarray(new_embeddings, dtype=np.float32)
-    dim = embeddings.shape[1]
-
-    # Reinitialize if index dimension does not match incoming vectors
-    if index is None or index.d != dim:
-        logger.info(f"Adapting FAISS index dimension to match vectors: {dim}")
+    if index is None:
         index = create_empty_index(dim)
-        metadata_list = []
+    elif index.d != dim:
+        raise ManifestMismatchError(f"Index dimension is {index.d}, new vectors are {dim}. Re-index the store.")
 
-    # Normalize vectors to unit length for cosine similarity
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    normalized_embeddings = embeddings / norms
+    if replace_doc is not None and index.ntotal:
+        keep = [i for i, m in enumerate(metadata_list) if m.get("doc_name") != replace_doc]
+        if len(keep) < index.ntotal:
+            kept_vectors = index.reconstruct_n(0, index.ntotal)[keep]
+            index = create_empty_index(dim)
+            if len(keep):
+                index.add(kept_vectors)
+            metadata_list = [metadata_list[i] for i in keep]
+            logger.info(f"Removed previous chunks of {replace_doc}; {len(keep)} vectors kept")
 
-    # Add to FAISS index
-    index.add(normalized_embeddings)
-    metadata_list.extend(new_chunks)
-
-    logger.info(f"Index now contains {index.ntotal} vectors after adding {len(new_chunks)} chunks")
+    index.add(vectors)
+    metadata_list = list(metadata_list) + list(new_chunks)
     return index, metadata_list
 
 
+def upsert_document(
+    bucket_name: str,
+    doc_name: str,
+    chunks: List[Dict[str, Any]],
+    embeddings: np.ndarray,
+    manifest: Manifest,
+    s3_client: Optional[Any] = None,
+) -> int:
+    """
+    Read-modify-write the store with optimistic concurrency.
+    Returns the total vector count after the write.
+    """
+    s3 = s3_client or boto3.client("s3")
+    for attempt in range(1, MAX_WRITE_ATTEMPTS + 1):
+        index, metadata, current_manifest, etag = load_store(bucket_name, s3)
+        if current_manifest is not None and current_manifest != manifest:
+            raise ManifestMismatchError(
+                f"Store was built with {current_manifest}, new vectors use {manifest}. "
+                "Run scripts/reindex_store.py to rebuild it with one embedding model."
+            )
+        index, metadata = add_chunks_to_index(index, metadata, chunks, embeddings, replace_doc=doc_name)
+
+        condition = {"IfMatch": etag} if etag else {"IfNoneMatch": "*"}
+        try:
+            s3.put_object(
+                Bucket=bucket_name,
+                Key=STORE_S3_KEY,
+                Body=serialize_store(index, metadata, manifest),
+                ContentType="application/octet-stream",
+                **condition,
+            )
+            logger.info(f"Store saved: {index.ntotal} vectors (attempt {attempt})")
+            return index.ntotal
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code not in ("PreconditionFailed", "ConditionalRequestConflict"):
+                raise
+            logger.warning(f"Concurrent store write detected ({code}); retrying ({attempt}/{MAX_WRITE_ATTEMPTS})")
+            time.sleep(min(2**attempt, 20) * random.uniform(0.5, 1.0))
+    raise RuntimeError(f"Could not write vector store after {MAX_WRITE_ATTEMPTS} attempts")
+
+
 def search_index(
-    index: faiss.IndexFlatIP,
+    index: faiss.Index,
     metadata_list: List[Dict[str, Any]],
     query_vector: np.ndarray,
     top_k: int = 3,
 ) -> List[Dict[str, Any]]:
-    """
-    Search index for top-k closest chunks to query vector using cosine similarity.
-
-    Args:
-        index: FAISS index object.
-        metadata_list: List of metadata dicts corresponding to vector IDs.
-        query_vector: Query embedding np.ndarray of shape (384,).
-        top_k: Number of nearest neighbors to retrieve.
-
-    Returns:
-        List of matching result dictionaries sorted by similarity score:
-        [
-            {
-                "score": 0.892,
-                "chunk_id": "contract.pdf_p2_c1",
-                "doc_name": "contract.pdf",
-                "page_number": 2,
-                "text": "..."
-            },
-            ...
-        ]
-    """
-    if index.ntotal == 0 or len(metadata_list) == 0:
-        logger.warning("Search called on empty index")
+    """Dense-only top-k search. Used by the local CLI runner."""
+    if index is None or index.ntotal == 0:
         return []
-
-    # Normalize query vector
-    q_vec = np.ascontiguousarray(query_vector.reshape(1, -1), dtype=np.float32)
-    norm = np.linalg.norm(q_vec)
-    if norm > 0:
-        q_vec = q_vec / norm
-
-    k = min(top_k, index.ntotal)
-    distances, indices = index.search(q_vec, k)
-
-    results: List[Dict[str, Any]] = []
+    q_vec = _normalize_rows(query_vector.reshape(1, -1))
+    distances, indices = index.search(q_vec, min(top_k, index.ntotal))
+    results = []
     for dist, idx in zip(distances[0], indices[0]):
-        if idx < 0 or idx >= len(metadata_list):
-            continue
-        meta = metadata_list[idx]
-        results.append({
-            "score": round(float(dist), 4),
-            "chunk_id": meta.get("chunk_id", f"chunk_{idx}"),
-            "doc_name": meta.get("doc_name", "unknown"),
-            "page_number": meta.get("page_number", 1),
-            "text": meta.get("text", ""),
-        })
-
+        if 0 <= idx < len(metadata_list):
+            meta = metadata_list[idx]
+            results.append({
+                "score": round(float(dist), 4),
+                "chunk_id": meta.get("chunk_id", f"chunk_{idx}"),
+                "doc_name": meta.get("doc_name", "unknown"),
+                "page_number": meta.get("page_number", 1),
+                "text": meta.get("text", ""),
+            })
     return results

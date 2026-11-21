@@ -1,6 +1,18 @@
 """
-Embedding Client for Query API Lambda.
-Generates normalized vector embeddings using Amazon Bedrock Titan or Hugging Face.
+Embedding providers shared by the indexing and query Lambdas.
+
+This file exists twice (src/idp_pipeline/embedding_utils.py and
+src/query_api/embedding_client.py) because each Lambda is packaged on its own.
+tests/test_embeddings.py fails if the two copies drift apart.
+
+Providers:
+- bedrock     Amazon Titan Text Embeddings V2 (256, 512 or 1024 dims)
+- huggingface sentence-transformers/all-MiniLM-L6-v2 via HF Inference (384 dims)
+- local-hash  Deterministic hashed bag-of-words. No network. For offline demos and tests.
+
+A provider failure raises EmbeddingError. Nothing falls back silently to another
+model: vectors from different models are not comparable, so a silent fallback
+corrupts the index.
 """
 
 import hashlib
@@ -9,168 +21,150 @@ import logging
 import os
 import re
 import time
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional
+
+import boto3
 import numpy as np
 import requests
-import boto3
-from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-DEFAULT_PROVIDER = os.environ.get("MODEL_PROVIDER", "huggingface").lower()
-HF_EMBEDDING_MODEL_ID = os.environ.get(
-    "EMBEDDING_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2"
-)
-HF_EMBEDDING_DIM = int(os.environ.get("VECTOR_DIM", "384"))
-HF_ROUTER_URL = f"https://router.huggingface.co/hf-inference/models/{HF_EMBEDDING_MODEL_ID}"
-HF_LEGACY_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL_ID}"
+BEDROCK_EMBEDDING_MODEL = os.environ.get("BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
+HF_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
+HF_EMBEDDING_DIM = 384
+LOCAL_HASH_DIM = 384
+TITAN_V2_DIMS = (256, 512, 1024)
+REGION = os.environ.get("BEDROCK_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
 
-BEDROCK_EMBEDDING_MODEL = os.environ.get(
-    "BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0"
-)
-BEDROCK_REGION = (
-    os.environ.get("BEDROCK_REGION")
-    or os.environ.get("AWS_REGION")
-    or os.environ.get("AWS_DEFAULT_REGION")
-    or "us-east-1"
-)
-BEDROCK_DEFAULT_DIM = 1024
+_PROVIDER_ALIASES = {
+    "bedrock": "bedrock",
+    "huggingface": "huggingface",
+    "opensource": "huggingface",
+    "local-hash": "local-hash",
+    "local": "local-hash",
+    "local-extractive": "local-hash",
+}
+
+_STOPWORDS = {
+    "what", "is", "the", "in", "and", "or", "to", "for", "of", "a", "an", "on",
+    "with", "at", "by", "from", "it", "this", "that", "these", "those", "how", "who",
+}
+
+
+class EmbeddingError(RuntimeError):
+    """The configured embedding provider could not produce a vector."""
+
+
+def resolve_provider(provider: Optional[str] = None) -> str:
+    name = (provider or os.environ.get("MODEL_PROVIDER") or "bedrock").lower()
+    if name not in _PROVIDER_ALIASES:
+        raise ValueError(f"Unknown embedding provider: {name}")
+    return _PROVIDER_ALIASES[name]
+
+
+def embedding_manifest(provider: Optional[str] = None) -> Dict[str, Any]:
+    """Identify the vector space. The store refuses to mix vectors from different manifests."""
+    p = resolve_provider(provider)
+    if p == "bedrock":
+        dim = int(os.environ.get("VECTOR_DIM", "1024"))
+        return {
+            "embedding_provider": p,
+            "embedding_model": BEDROCK_EMBEDDING_MODEL,
+            "dim": dim if dim in TITAN_V2_DIMS else 1024,
+        }
+    if p == "huggingface":
+        return {"embedding_provider": p, "embedding_model": HF_EMBEDDING_MODEL, "dim": HF_EMBEDDING_DIM}
+    return {"embedding_provider": p, "embedding_model": "hashed-bow-v1", "dim": LOCAL_HASH_DIM}
 
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
-    """L2-normalize vector to unit length."""
     norm = np.linalg.norm(vec)
-    return vec / norm if norm > 0 else vec
+    return (vec / norm if norm > 0 else vec).astype(np.float32)
 
 
-def _adapt_dimension(vec: np.ndarray, target_dim: Optional[int]) -> np.ndarray:
-    """
-    Guarantees mathematical dimension alignment with FAISS index.
-    If target_dim is provided and differs from vector length:
-    - Truncates if vec.shape[0] > target_dim
-    - Zero-pads if vec.shape[0] < target_dim
-    Then re-normalizes to preserve cosine similarity.
-    """
-    if not target_dim or vec.shape[0] == target_dim:
-        return _normalize(vec)
-    if vec.shape[0] > target_dim:
-        adapted = vec[:target_dim]
-    else:
-        adapted = np.pad(vec, (0, target_dim - vec.shape[0]), mode="constant")
-    return _normalize(adapted)
+def _clean(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def _offline_fallback(text: str, dim: int = HF_EMBEDDING_DIM) -> np.ndarray:
-    """
-    Generate deterministic positive term-frequency hashed vector for offline queries.
-    Matches feature hashing logic from indexing for high keyword cosine overlap.
-    """
+def local_hash_embedding(text: str, dim: int = LOCAL_HASH_DIM) -> np.ndarray:
+    """Hashed unigrams + bigrams. Lexical only, but deterministic and free."""
     vec = np.zeros(dim, dtype=np.float32)
-    stops = {
-        "what", "is", "the", "in", "and", "or", "to", "for", "of", "a", "an", "on",
-        "with", "at", "by", "from", "it", "this", "that", "these", "those", "how", "who"
-    }
-    raw = re.findall(r"[a-z0-9]+", text.lower())
-    words = [w for w in raw if w not in stops and len(w) > 1]
-
+    words = [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in _STOPWORDS and len(w) > 1]
     for w in words:
-        h = int(hashlib.md5(w.encode("utf-8")).hexdigest(), 16)
-        vec[h % dim] += 2.0
-
-    # Bigrams for phrase preservation
-    for i in range(len(words) - 1):
-        bigram = f"{words[i]}_{words[i+1]}"
-        h = int(hashlib.md5(bigram.encode("utf-8")).hexdigest(), 16)
-        vec[h % dim] += 1.5
-
+        vec[int(hashlib.md5(w.encode()).hexdigest(), 16) % dim] += 2.0
+    for a, b in zip(words, words[1:]):
+        vec[int(hashlib.md5(f"{a}_{b}".encode()).hexdigest(), 16) % dim] += 1.5
     return _normalize(vec)
 
 
-def _get_bedrock_query_embedding(
-    text: str,
-    model_id: str = BEDROCK_EMBEDDING_MODEL,
-    dimensions: int = BEDROCK_DEFAULT_DIM,
-    region_name: Optional[str] = None,
-) -> np.ndarray:
-    """Invoke Bedrock Titan Embedding for query."""
-    region = region_name or BEDROCK_REGION
-    client = boto3.client("bedrock-runtime", region_name=region)
-
-    if "titan-embed-text-v2" in model_id:
-        payload = {
-            "inputText": text,
-            "dimensions": dimensions,
-            "normalize": True,
-        }
-    else:
-        payload = {"inputText": text}
-
+def _bedrock_embedding(client: Any, text: str, manifest: Dict[str, Any]) -> np.ndarray:
     response = client.invoke_model(
-        modelId=model_id,
-        body=json.dumps(payload),
+        modelId=manifest["embedding_model"],
+        body=json.dumps({"inputText": text, "dimensions": manifest["dim"], "normalize": True}),
         contentType="application/json",
         accept="application/json",
     )
-    resp_body = json.loads(response["body"].read())
-    return _normalize(np.array(resp_body["embedding"], dtype=np.float32))
+    return _normalize(np.array(json.loads(response["body"].read())["embedding"], dtype=np.float32))
 
 
-def get_query_embedding(
-    text: str,
-    provider: Optional[str] = None,
-    model_id: Optional[str] = None,
-    token: Optional[str] = None,
-    region_name: Optional[str] = None,
-    target_dim: Optional[int] = None,
-) -> np.ndarray:
-    """
-    Generate normalized embedding for user query.
-    Strict No-Bedrock Default: Open-Source Hugging Face / Sentence-Transformers (384-d),
-    with automatic vector dimension adaptation matching index.d.
-    """
-    clean_text = text.replace("\n", " ").strip()
-    chosen_provider = (provider or DEFAULT_PROVIDER).lower()
-    expected_dim = target_dim or HF_EMBEDDING_DIM
-
-    # 1. Primary Open-Source Path (Hugging Face Serverless)
-    if chosen_provider in ("huggingface", "opensource", "default"):
-        api_token = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN", "")
-        if api_token:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_token.strip()}",
-            }
-            try:
-                res = requests.post(
-                    HF_ROUTER_URL,
-                    headers=headers,
-                    json={"inputs": clean_text, "options": {"wait_for_model": True}},
-                    timeout=5,
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    vec = np.array(data, dtype=np.float32)
-                    if vec.ndim == 2:
-                        vec = np.mean(vec, axis=0)
-                    elif vec.ndim > 2:
-                        vec = vec.flatten()[:HF_EMBEDDING_DIM]
-                    if vec.shape[0] == HF_EMBEDDING_DIM:
-                        return _adapt_dimension(vec, target_dim=expected_dim)
-            except Exception as e:
-                logger.warning(f"HF query embedding call error: {e}")
-
-        return _adapt_dimension(_offline_fallback(clean_text, dim=HF_EMBEDDING_DIM), target_dim=expected_dim)
-
-    # 2. Legacy Bedrock Path (only if explicitly specified)
-    if chosen_provider == "bedrock":
+def _hf_embeddings(texts: List[str], token: Optional[str], retries: int = 3) -> List[np.ndarray]:
+    """One HTTP call per batch. The feature-extraction endpoint accepts a list of inputs."""
+    api_token = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    if not api_token:
+        raise EmbeddingError("Hugging Face provider needs HF_TOKEN")
+    url = f"https://router.huggingface.co/hf-inference/models/{HF_EMBEDDING_MODEL}/pipeline/feature-extraction"
+    headers = {"Authorization": f"Bearer {api_token.strip()}"}
+    last_error = ""
+    for attempt in range(retries):
         try:
-            m_id = model_id or BEDROCK_EMBEDDING_MODEL
-            dim = target_dim or (1536 if "titan-embed-text-v1" in m_id else BEDROCK_DEFAULT_DIM)
-            vec = _get_bedrock_query_embedding(clean_text, model_id=m_id, dimensions=dim, region_name=region_name)
-            return _adapt_dimension(vec, target_dim=expected_dim)
-        except Exception as e:
-            logger.warning(f"Bedrock query embedding error ({e}), trying fallback.")
-            return _adapt_dimension(_offline_fallback(clean_text, dim=HF_EMBEDDING_DIM), target_dim=expected_dim)
+            res = requests.post(url, headers=headers, json={"inputs": texts}, timeout=30)
+            if res.status_code == 200:
+                arr = np.array(res.json(), dtype=np.float32)
+                if arr.ndim == 3:  # token-level output: mean-pool
+                    arr = arr.mean(axis=1)
+                if arr.shape != (len(texts), HF_EMBEDDING_DIM):
+                    raise EmbeddingError(f"Unexpected HF embedding shape {arr.shape}")
+                return [_normalize(v) for v in arr]
+            last_error = f"HTTP {res.status_code}: {res.text[:200]}"
+        except requests.RequestException as e:
+            last_error = str(e)
+        time.sleep(2**attempt)
+    raise EmbeddingError(f"Hugging Face embedding failed: {last_error}")
 
-    return _adapt_dimension(_offline_fallback(clean_text, dim=expected_dim), target_dim=expected_dim)
+
+def get_batch_embeddings(
+    texts: List[str],
+    provider: Optional[str] = None,
+    token: Optional[str] = None,
+    batch_size: int = 16,
+    max_workers: int = 8,
+) -> np.ndarray:
+    """Embed many texts. Returns an (n, dim) float32 array of unit vectors."""
+    manifest = embedding_manifest(provider)
+    p = manifest["embedding_provider"]
+    texts = [_clean(t) or " " for t in texts]
+
+    if p == "local-hash":
+        vectors = [local_hash_embedding(t, manifest["dim"]) for t in texts]
+    elif p == "huggingface":
+        vectors = []
+        for i in range(0, len(texts), batch_size):
+            vectors.extend(_hf_embeddings(texts[i : i + batch_size], token))
+    else:
+        # Titan has no batch API: run requests concurrently (I/O bound).
+        client = boto3.client("bedrock-runtime", region_name=REGION)
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                vectors = list(pool.map(lambda t: _bedrock_embedding(client, t, manifest), texts))
+        except Exception as e:
+            raise EmbeddingError(f"Bedrock embedding failed: {e}") from e
+
+    if not vectors:
+        return np.zeros((0, manifest["dim"]), dtype=np.float32)
+    return np.vstack(vectors).astype(np.float32)
+
+
+def get_embedding(text: str, provider: Optional[str] = None, token: Optional[str] = None) -> np.ndarray:
+    return get_batch_embeddings([text], provider=provider, token=token)[0]

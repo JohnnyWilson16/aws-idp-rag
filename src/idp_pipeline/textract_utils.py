@@ -10,6 +10,7 @@ Handles:
 
 import logging
 from typing import Any, Dict, List, Optional
+
 import boto3
 
 logger = logging.getLogger(__name__)

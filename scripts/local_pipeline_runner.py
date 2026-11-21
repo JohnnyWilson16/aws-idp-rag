@@ -1,204 +1,91 @@
 """
-Local End-to-End Pipeline Runner & Verification CLI.
+Run the IDP + RAG pipeline locally on PDFs, with no deployed stack.
 
-Demonstrates the full IDP + RAG workflow locally:
-1. Ingests local PDF documents (e.g. samples/master_service_agreement.pdf).
-2. Extracts text preserving exact page numbers.
-3. Chunks text with sliding window and metadata attribution.
-4. Generates embeddings (Amazon Bedrock Titan V2 / Hugging Face all-MiniLM-L6-v2).
-5. Builds and queries a FAISS IndexFlatIP vector store.
-6. Formulates strictly grounded prompt and retrieves answers with verified page citations via Bedrock or Hugging Face.
+It uses the same chunking, embedding, indexing, retrieval and answer code as
+the Lambdas. Only OCR differs: it reads the PDF text layer with pypdf.
+
+    python scripts/local_pipeline_runner.py --provider local      # offline, no credentials
+    python scripts/local_pipeline_runner.py --provider bedrock    # needs AWS credentials + Bedrock access
+    python scripts/local_pipeline_runner.py --provider huggingface --hf-token hf_...
 """
 
 import argparse
 import os
 import sys
-from typing import Dict, List
-import faiss
-import numpy as np
-from pypdf import PdfReader
+import time
 
-# Add src directories to Python module path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src/idp_pipeline")))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src/query_api")))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(ROOT, "src", "idp_pipeline"))
+sys.path.insert(0, os.path.join(ROOT, "src", "query_api"))
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
-from textract_utils import chunk_document_pages
-from embedding_utils import get_batch_embeddings, get_embedding
-from faiss_indexer import add_chunks_to_index, create_empty_index, search_index
-from app import _call_bedrock_llm, _call_huggingface_llm, _generate_extractive_fallback
+import app  # noqa: E402  (query Lambda)
+from embedding_utils import get_batch_embeddings  # noqa: E402
+from faiss_indexer import add_chunks_to_index  # noqa: E402
+from pypdf import PdfReader  # noqa: E402
+from textract_utils import chunk_document_pages  # noqa: E402
 
-
-def extract_pages_from_pdf(pdf_path: str) -> Dict[int, Dict]:
-    """Extract text from local PDF mapping to 1-indexed pages."""
-    reader = PdfReader(pdf_path)
-    pages_map = {}
-    for idx, page in enumerate(reader.pages, start=1):
-        raw_text = page.extract_text() or ""
-        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-        pages_map[idx] = {
-            "page_number": idx,
-            "lines": lines,
-            "full_text": "\n".join(lines),
-            "average_confidence": 100.0,
-        }
-    return pages_map
+SAMPLES = [os.path.join(ROOT, "samples", f) for f in ("master_service_agreement.pdf", "cloud_services_invoice.pdf")]
+QUESTIONS = [
+    "What is the aggregate liability cap in the Master Services Agreement?",
+    "What are the payment terms and late fees on invoices?",
+    "What uptime percentage does the service level agreement commit to?",
+    "What is the total amount due on the invoice?",
+    "What is the capital of Mars?",
+]
 
 
-def run_pipeline(
-    pdf_paths: List[str],
-    queries: List[str],
-    provider: str = "bedrock",
-    model_id: str = "anthropic.claude-3-haiku-20240307-v1:0",
-    hf_token: str = "",
-):
-    """Execute end-to-end local IDP and RAG verification."""
-    print("=" * 70)
-    print(f"⚡ AWS SERVERLESS IDP + RAG PIPELINE ({provider.upper()} MODE)")
-    print("=" * 70)
+def extract_pages(pdf_path: str) -> dict:
+    pages = {}
+    for n, page in enumerate(PdfReader(pdf_path).pages, start=1):
+        lines = [ln.strip() for ln in (page.extract_text() or "").splitlines() if ln.strip()]
+        pages[n] = {"page_number": n, "lines": lines, "full_text": "\n".join(lines)}
+    return pages
 
-    # 1. Document Ingestion & Chunking
-    index = None
-    metadata_list = []
-    total_pages = 0
 
-    for path in pdf_paths:
-        if not os.path.exists(path):
-            print(f"Warning: File not found: {path}")
-            continue
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--provider", choices=["local", "bedrock", "huggingface"], default="local")
+    parser.add_argument("--model", help="LLM model ID (bedrock or huggingface only)")
+    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
+    parser.add_argument("pdfs", nargs="*", default=SAMPLES)
+    args = parser.parse_args()
 
+    index, metadata = None, []
+    for path in args.pdfs:
         doc_name = os.path.basename(path)
-        print(f"\n[1/4] Processing Document: {doc_name}")
-        pages_map = extract_pages_from_pdf(path)
-        total_pages += len(pages_map)
-        print(f"      -> Extracted {len(pages_map)} pages.")
+        chunks = chunk_document_pages(extract_pages(path), doc_name=doc_name, max_chunk_chars=2000, overlap_chars=200)
+        texts = [f"Document: {c['doc_name']} Page: {c['page_number']}\n{c['text']}" for c in chunks]
+        embeddings = get_batch_embeddings(texts, provider=args.provider, token=args.hf_token)
+        index, metadata = add_chunks_to_index(index, metadata, chunks, embeddings, replace_doc=doc_name)
+        print(f"Indexed {doc_name}: {len(chunks)} chunks")
+    print(f"Index: {index.ntotal} vectors, dim={index.d}\n")
 
-        chunks = chunk_document_pages(
-            pages_map=pages_map,
-            doc_name=doc_name,
-            max_chunk_chars=1800,
-            overlap_chars=200,
-        )
-        print(f"      -> Created {len(chunks)} text chunks with page citations.")
-
-        # 2. Embedding Generation
-        print(f"[2/4] Generating embeddings via {provider}...")
-        texts = [c["text"] for c in chunks]
-        embeddings = get_batch_embeddings(texts, provider=provider, token=hf_token)
-
-        # 3. Vector Indexing
-        if index is None:
-            dim = embeddings.shape[1]
-            index = create_empty_index(dim)
-            print(f"      -> Initialized FAISS IndexFlatIP (dim={dim})")
-
-        print(f"[3/4] Indexing vectors into FAISS IndexFlatIP (Cosine Similarity)...")
-        index, metadata_list = add_chunks_to_index(index, metadata_list, chunks, embeddings)
-
-    print(f"\n✅ Indexing complete: {index.ntotal} total vectors across {total_pages} pages.\n")
-
-    # 4. Query & RAG Retrieval
-    print("=" * 70)
-    print("🔍 TESTING RAG RETRIEVAL & GROUNDED CITATIONS")
-    print("=" * 70)
-
-    for q_idx, question in enumerate(queries, start=1):
-        print(f"\n❓ Question {q_idx}: '{question}'")
-        q_vec = get_embedding(question, provider=provider, token=hf_token, model_id=None)
-        matches = search_index(index, metadata_list, q_vec, top_k=3)
-
-        print(f"   Retrieved {len(matches)} matching chunks:")
-        for m_idx, m in enumerate(matches, start=1):
-            print(
-                f"   • Excerpt {m_idx}: [{m['doc_name']} - Page {m['page_number']}] "
-                f"(Relevance Score: {m['score']:.4f})"
-            )
-
-        # Build prompt
-        context_blocks = [
-            f"[Excerpt {i}] Document: {m['doc_name']} | Page: {m['page_number']}\n{m['text']}"
-            for i, m in enumerate(matches, start=1)
-        ]
-        context_str = "\n\n".join(context_blocks)
-
-        system_prompt = (
-            "You are an expert AI assistant performing Intelligent Document Retrieval.\n"
-            "Answer the user's question ONLY using the provided document excerpts below.\n"
-            "If the answer cannot be found in the excerpts, state clearly: "
-            "'I cannot find the answer to this question in the provided documents.'\n"
-            "Always cite the specific Document Name and Page Number for every claim made."
-        )
-        user_prompt = (
-            f"--- CONTEXT EXCERPTS ---\n{context_str}\n\n"
-            f"--- USER QUESTION ---\n{question}\n\n"
-            f"--- INSTRUCTIONS FOR ANSWER ---\n"
-            f"1. Base your answer purely on the context excerpts.\n"
-            f"2. Cite document names and page numbers in brackets.\n"
-            f"3. Keep the answer clear and concise."
-        )
+    bm25 = app.BM25.from_metadata(metadata)
+    for question in QUESTIONS:
+        q_vec = get_batch_embeddings([question], provider=args.provider, token=args.hf_token)[0]
+        t0 = time.perf_counter()
+        sources = app._retrieve_top_k(index, metadata, q_vec, question, top_k=3, bm25=bm25)
+        retrieve_ms = (time.perf_counter() - t0) * 1000
 
         answer = None
-        if provider == "bedrock":
-            answer = _call_bedrock_llm(
-                prompt_system=system_prompt,
-                prompt_user=user_prompt,
-                model_id=model_id,
-                max_tokens=400,
-            )
-
+        if sources and args.provider != "local":
+            prompt = app._build_user_prompt(question, sources)
+            if args.provider == "bedrock":
+                answer = app._call_bedrock_llm(app.SYSTEM_PROMPT, prompt, args.model or app.BEDROCK_DEFAULT_LLM_MODEL)
+            else:
+                answer = app._call_huggingface_llm(
+                    app.SYSTEM_PROMPT, prompt, args.model or app.HF_DEFAULT_LLM_MODEL, hf_token=args.hf_token
+                )
         if not answer:
-            answer = _call_huggingface_llm(
-                prompt_system=system_prompt,
-                prompt_user=user_prompt,
-                model_id=model_id,
-                hf_token=hf_token,
-                max_tokens=400,
-            )
+            answer = app._extractive_answer(question, sources) if sources else app.NOT_FOUND
 
-        if not answer:
-            answer = _generate_extractive_fallback(question, matches)
-
-        print("\n💬 Grounded Assistant Response:")
-        print("-" * 50)
-        print(answer)
-        print("-" * 50)
+        print(f"Q: {question}   (retrieval {retrieve_ms:.2f} ms)")
+        for s in sources:
+            print(f"   [{s['doc_name']} p{s['page_number']}] fused={s['relevance_score']} "
+                  f"dense={s['dense_score']} bm25={s['sparse_score']}")
+        print(f"A: {answer}\n")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run local RAG pipeline verification")
-    parser.add_argument(
-        "--provider",
-        choices=["bedrock", "huggingface"],
-        default="bedrock",
-        help="AI Provider: 'bedrock' (Amazon Bedrock) or 'huggingface'",
-    )
-    parser.add_argument(
-        "--model",
-        default=None,
-        help="Model ID (defaults to 'amazon.nova-micro-v1:0' for bedrock, 'meta-llama/Llama-3.2-3B-Instruct' for huggingface)",
-    )
-    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""), help="Hugging Face API Token")
-    args = parser.parse_args()
-
-    chosen_model = args.model
-    if not chosen_model:
-        chosen_model = "amazon.nova-micro-v1:0" if args.provider == "bedrock" else "meta-llama/Llama-3.2-3B-Instruct"
-
-    sample_docs = [
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "../samples/master_service_agreement.pdf")),
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "../samples/cloud_services_invoice.pdf")),
-    ]
-
-    sample_questions = [
-        "What is the aggregate liability cap in the Master Services Agreement?",
-        "What are the payment terms and late fees on invoices?",
-        "What uptime percentage does the service level agreement commit to?",
-        "What is the total amount due on invoice INV-2026-8891?",
-    ]
-
-    run_pipeline(
-        pdf_paths=sample_docs,
-        queries=sample_questions,
-        provider=args.provider,
-        model_id=chosen_model,
-        hf_token=args.hf_token,
-    )
+    main()

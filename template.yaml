@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  AWS Serverless IDP + RAG Pipeline using Open-Source Models (Strict Bedrock Prohibition Compliant)
-  Documents -> OCR (Textract Async) -> S3 -> Step Functions -> FAISS Index (384-d) -> Query API -> Open-Source LLMs (Hugging Face / Extractive)
+  Serverless IDP + hybrid RAG pipeline.
+  S3 upload -> Step Functions -> Textract async OCR -> chunking -> embeddings -> FAISS store on S3 -> Query API (BM25 + dense) -> Bedrock / Hugging Face
 
 Parameters:
   Environment:
@@ -39,14 +39,23 @@ Parameters:
 
   VectorDim:
     Type: Number
-    Default: 384
-    Description: Embedding vector dimensionality (384 for sentence-transformers/all-MiniLM-L6-v2).
+    Default: 1024
+    AllowedValues: [256, 512, 1024]
+    Description: Titan V2 embedding size when ModelProvider=bedrock. Hugging Face MiniLM is always 384.
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: (Optional) Email address that receives pipeline failure alarms.
 
   HuggingFaceToken:
     Type: String
     NoEcho: true
     Default: ""
     Description: (Optional) Hugging Face API Token.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
 
 Globals:
   Function:
@@ -160,10 +169,7 @@ Resources:
                 Resource: "*"
               - Effect: Allow
                 Action:
-                  - bedrock:InvokeModel
-                  - bedrock:Converse
-                  - bedrock:ListFoundationModels
-                  - bedrock:GetFoundationModel
+                  - bedrock:InvokeModel  # also authorizes the Converse API
                 Resource: "*"
 
   QueryApiLambdaRole:
@@ -185,18 +191,14 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:ListBucket
-                Resource:
-                  - !GetAtt DocumentStorageBucket.Arn
-                  - !Sub "${DocumentStorageBucket.Arn}/*"
+                Action: s3:ListBucket  # lets HeadObject return 404 (not 403) before the first upload
+                Resource: !GetAtt DocumentStorageBucket.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DocumentStorageBucket.Arn}/vector_store/*"
               - Effect: Allow
                 Action:
-                  - bedrock:InvokeModel
-                  - bedrock:Converse
-                  - bedrock:ListFoundationModels
-                  - bedrock:GetFoundationModel
+                  - bedrock:InvokeModel  # also authorizes the Converse API
                 Resource: "*"
 
   DocumentApiLambdaRole:
@@ -347,6 +349,10 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: !Ref Environment
+      # Caps request rate so a public demo URL cannot run up Bedrock / Textract cost.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
       CorsConfiguration:
         AllowMethods:
           - GET
@@ -471,6 +477,52 @@ Resources:
         - Arn: !Ref DocumentProcessingStateMachine
           Id: StepFunctionTarget
           RoleArn: !GetAtt EventBridgeToStepFunctionsRole.Arn
+
+  ##############################################################################
+  # 7. MONITORING: alarms on failed ingestions and query errors
+  ##############################################################################
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: !If
+        - HasAlarmEmail
+        - - Endpoint: !Ref AlarmEmail
+            Protocol: email
+        - !Ref AWS::NoValue
+
+  PipelineFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A document ingestion (Step Functions execution) failed.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref DocumentProcessingStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  QueryErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The query Lambda raised errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QueryApiFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
 
 Outputs:
   ApiEndpoint:

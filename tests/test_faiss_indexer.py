@@ -2,15 +2,16 @@
 Unit tests for FAISS vector indexer, cosine similarity ranking, and search.
 """
 
-import sys
 import os
+import sys
 import unittest
+
 import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src/idp_pipeline")))
 from faiss_indexer import (
-    create_empty_index,
     add_chunks_to_index,
+    create_empty_index,
     search_index,
 )
 
@@ -94,22 +95,14 @@ class TestFAISSIndexer(unittest.TestCase):
         self.assertEqual(results[0]["chunk_id"], "c1")
         self.assertAlmostEqual(results[0]["score"], 1.0, places=2)
 
-    def test_dimension_adaptation(self):
-        """Verify that vectors adapt to target dimension without crashing FAISS search."""
-        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src/query_api")))
-        from embedding_client import _adapt_dimension
+    def test_dimension_mismatch_is_rejected(self):
+        """Vectors from another model must never be truncated or padded into the index."""
+        from faiss_indexer import ManifestMismatchError
 
-        # 384-d vector adapted to 1024-d index
-        vec_384 = np.ones(384, dtype=np.float32)
-        adapted_1024 = _adapt_dimension(vec_384, target_dim=1024)
-        self.assertEqual(adapted_1024.shape[0], 1024)
-        self.assertAlmostEqual(np.linalg.norm(adapted_1024), 1.0, places=4)
-
-        # 1024-d vector adapted to 384-d index
-        vec_1024 = np.ones(1024, dtype=np.float32)
-        adapted_384 = _adapt_dimension(vec_1024, target_dim=384)
-        self.assertEqual(adapted_384.shape[0], 384)
-        self.assertAlmostEqual(np.linalg.norm(adapted_384), 1.0, places=4)
+        idx, meta = add_chunks_to_index(self.index, self.metadata_list, self.chunks, self.embeddings)
+        other_model = np.ones((1, 1024), dtype=np.float32)
+        with self.assertRaises(ManifestMismatchError):
+            add_chunks_to_index(idx, meta, [self.chunks[0]], other_model)
 
     def test_hybrid_retrieval(self):
         """Verify Dense (FAISS) + Sparse (Lexical) Hybrid Search with exact document matching."""

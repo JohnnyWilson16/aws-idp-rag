@@ -10,10 +10,10 @@ Features:
 - System Architecture & Free-Tier Cost Transparency Dashboard.
 """
 
-import json
 import os
 import time
 from typing import Any, Dict, List, Optional
+
 import requests
 import streamlit as st
 
@@ -94,10 +94,7 @@ if "messages" not in st.session_state:
     ]
 
 if "api_url" not in st.session_state:
-    st.session_state.api_url = os.environ.get(
-        "API_GATEWAY_URL",
-        "https://lq2w2n8jae.execute-api.us-east-1.amazonaws.com/dev",
-    )
+    st.session_state.api_url = os.environ.get("API_GATEWAY_URL", "")
 
 if "hf_token" not in st.session_state:
     st.session_state.hf_token = os.environ.get("HF_TOKEN", "")
@@ -209,7 +206,7 @@ with st.sidebar:
             index=0,
             help="High-speed, cost-effective serverless inference on AWS Bedrock.",
         )
-        st.caption("Embedding Engine: `amazon.titan-embed-text-v2:0` (1024-d / adaptive) with grounded semantic synthesis")
+        st.caption("Retrieval uses the embedding model that built the index (see the store manifest).")
     elif provider_choice.startswith("Open-Source"):
         provider_key = "huggingface"
         selected_model = st.selectbox(
@@ -261,7 +258,7 @@ with st.sidebar:
                     st.info(f"Uploading {uploaded_file.name} to Amazon S3...")
                     success = upload_file_to_s3(upload_target, file_bytes, c_type)
                     if success:
-                        st.success(f"Uploaded successfully! S3 event triggered Step Functions processing.")
+                        st.success("Uploaded successfully! S3 event triggered Step Functions processing.")
                         st.rerun()
                     else:
                         st.error("Failed to upload document bytes to S3.")
@@ -317,7 +314,7 @@ with st.sidebar:
 # ==============================================================================
 st.markdown("<div class='main-header'>⚡ Serverless IDP + RAG Assistant</div>", unsafe_allow_html=True)
 st.markdown(
-    "<div class='sub-header'>End-to-End Intelligent Document Processing on AWS (Open-Source Models • Textract Async • Step Functions • S3 FAISS • Strict Bedrock Prohibition Compliant)</div>",
+    "<div class='sub-header'>End-to-End Intelligent Document Processing on AWS (Textract Async • Step Functions • FAISS on S3 • BM25 + Dense Hybrid Search • Bedrock / Hugging Face)</div>",
     unsafe_allow_html=True,
 )
 
@@ -448,7 +445,7 @@ flowchart TD
 | AWS / Cloud Service | Free Tier / Standard Pricing | System Usage in This Project | Monthly Cost |
 | :--- | :--- | :--- | :--- |
 | **Amazon Bedrock (Titan Embeddings V2)** | $0.02 per 1,000,000 input tokens | 1024-d embeddings for document chunks & queries | **<$0.01** |
-| **Amazon Bedrock (Claude 3 Haiku)** | $0.00025 / 1K in, $0.00125 / 1K out | Grounded prompt synthesis and citation formatting | **<$0.05** |
+| **Amazon Bedrock (Nova Micro)** | $0.035 / 1M in, $0.14 / 1M out | Grounded answers with citations | **<$0.05** |
 | **Amazon S3** | 5 GB Standard Storage, 20,000 GETs, 2,000 PUTs | Document uploads, raw OCR JSON, FAISS index artifacts | **$0.00** |
 | **AWS Lambda** | 1,000,000 requests/month, 3.2M sec compute | IDP processor, Document API, Query API | **$0.00** |
 | **Amazon DynamoDB** | 25 GB Storage, 25 RCU / 25 WCU | Document processing states, page counts, chunk tracking | **$0.00** |
@@ -456,6 +453,8 @@ flowchart TD
 | **Amazon Textract** | 1,000 pages / month (DetectDocumentText) | Multi-page PDF & scanned image asynchronous OCR | **$0.00** |
 | **Amazon API Gateway** | 1,000,000 HTTP API calls / month | Lightweight REST API routes (/query, /documents) | **$0.00** |
 | **TOTAL ESTIMATED BILL** | | | **<$0.10 / month** |
+
+_Estimate for low demo traffic inside free-tier limits. Check current AWS pricing for your account._
         """
     )
 
@@ -463,10 +462,10 @@ flowchart TD
     st.markdown("### 🛡️ Design Decisions & Trade-Offs")
     st.markdown(
         """
-        1. **Native Amazon Bedrock Integration**: Utilizes industry-standard Foundation Models (`amazon.titan-embed-text-v2:0` for 1024-d embeddings and `anthropic.claude-3-haiku-20240307-v1:0` via the unified Bedrock Converse API).
-        2. **Multi-Provider Fallback**: If Bedrock access is not yet enabled or during offline local development, the system seamlessly falls back to Hugging Face Serverless APIs or local deterministic hashing.
-        3. **FAISS in S3 vs. Amazon OpenSearch Serverless**: OpenSearch Serverless charges an active base cost of 4 OCUs ($0.24/OCU/hr ≈ $700/month!). Using FAISS Flat indexes persisted in S3 and cached in Lambda `/tmp` costs $0.00 and provides sub-4ms retrieval for small-to-medium enterprise document collections.
+        1. **Amazon Bedrock**: `amazon.titan-embed-text-v2:0` embeddings and Amazon Nova Micro through the Converse API.
+        2. **One embedding model per index**: The store records which model built it. Queries always embed with that model. If it is unavailable, retrieval runs on BM25 only instead of mixing vector spaces.
+        3. **FAISS in S3 vs. Amazon OpenSearch Serverless**: OpenSearch Serverless charges an active base cost of 4 OCUs ($0.24/OCU/hr ≈ $700/month!). A FAISS flat index stored as one S3 object and cached in Lambda memory costs almost nothing and keeps retrieval in the low milliseconds for small and medium collections.
         4. **Asynchronous Textract with Step Functions**: Multi-page PDFs cannot be processed synchronously due to Textract payload limits. Step Functions provides resilient, serverless polling and error handling with zero idle compute cost.
-        5. **Hallucination Prevention**: Prompts explicitly forbid speculative reasoning and mandate source citation format `[Document: ..., Page: ...]`.
+        5. **Grounding**: The prompt allows only the retrieved excerpts and requires `[Document: ..., Page: ...]` citations. Without an LLM, the API returns quoted source sentences only.
         """
     )

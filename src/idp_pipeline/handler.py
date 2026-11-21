@@ -9,27 +9,23 @@ Orchestrated by AWS Step Functions to perform:
 5. Update DynamoDB status to COMPLETED or FAILED
 """
 
-from datetime import datetime, timezone
 import json
 import logging
 import os
 import urllib.parse
+from datetime import datetime, timezone
 from typing import Any, Dict
+
 import boto3
 from botocore.exceptions import ClientError
-
+from embedding_utils import embedding_manifest, get_batch_embeddings
+from faiss_indexer import STORE_S3_KEY, upsert_document
 from textract_utils import (
-    start_document_text_detection,
     check_document_text_detection_status,
+    chunk_document_pages,
     fetch_all_textract_blocks,
     parse_textract_blocks,
-    chunk_document_pages,
-)
-from embedding_utils import get_batch_embeddings
-from faiss_indexer import (
-    load_index_from_s3,
-    save_index_to_s3,
-    add_chunks_to_index,
+    start_document_text_detection,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +94,7 @@ def _extract_pages_fallback(s3_bucket: str, s3_key: str) -> Dict[str, Dict[str, 
     Handles both PDFs and direct image uploads (.png, .jpg, .jpeg, etc.).
     """
     import io
+
     from pypdf import PdfReader
 
     logger.info(f"Extracting pages for s3://{s3_bucket}/{s3_key} using fallback OCR engine")
@@ -339,32 +336,16 @@ def handle_process_and_index(event: Dict[str, Any]) -> Dict[str, Any]:
     )
     chunk_count = len(chunks)
 
-    # 4. Generate embeddings via Open-Source Sentence-Transformers (Strict Bedrock Prohibition Compliant)
-    provider = event.get("provider") or os.environ.get("MODEL_PROVIDER", "huggingface").lower()
-    model_id = event.get("embedding_model") or os.environ.get("EMBEDDING_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
-    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    # 4. Embed chunks. A provider failure raises, and Step Functions routes it to HandleFailure.
+    manifest = embedding_manifest()
     chunk_texts = [f"Document: {c.get('doc_name', '')} Page: {c.get('page_number', 1)}\n{c['text']}" for c in chunks]
 
     if chunk_texts:
-        logger.info(f"Generating embeddings for {len(chunk_texts)} chunks using provider: {provider} ({model_id})...")
-        embeddings = get_batch_embeddings(
-            chunk_texts,
-            provider=provider,
-            model_id=model_id,
-            token=hf_token,
-        )
+        logger.info(f"Embedding {len(chunk_texts)} chunks with {manifest}")
+        embeddings = get_batch_embeddings(chunk_texts, provider=manifest["embedding_provider"])
 
-        # 5. Load or create FAISS index from S3 and append new vectors
-        index, metadata_list = load_index_from_s3(s3_bucket)
-        index, metadata_list = add_chunks_to_index(
-            index=index,
-            metadata_list=metadata_list,
-            new_chunks=chunks,
-            new_embeddings=embeddings,
-        )
-
-        # 6. Save updated index and metadata back to S3
-        save_index_to_s3(index, metadata_list, s3_bucket)
+        # 5-6. Replace this document's vectors in the S3 store (conditional write, retried on conflict)
+        upsert_document(s3_bucket, filename, chunks, embeddings, manifest, s3_client=s3_client)
 
         # 7. Update DynamoDB status to COMPLETED
         now = _now_iso()
@@ -381,7 +362,7 @@ def handle_process_and_index(event: Dict[str, Any]) -> Dict[str, Any]:
                 ":pc": page_count,
                 ":cc": chunk_count,
                 ":ek": extracted_s3_key,
-                ":vk": "vector_store/index.faiss",
+                ":vk": STORE_S3_KEY,
                 ":u": now,
             },
         )

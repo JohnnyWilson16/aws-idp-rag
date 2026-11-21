@@ -2,8 +2,8 @@
 Unit tests for document chunking with strict page-level metadata preservation.
 """
 
-import sys
 import os
+import sys
 import unittest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src/idp_pipeline")))

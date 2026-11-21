@@ -1,0 +1,4 @@
+-r src/idp_pipeline/requirements.txt
+pytest>=8
+ruff>=0.6
+cfn-lint>=1

@@ -7,14 +7,13 @@ Endpoints:
 - GET /documents/{id}: Get detailed status of a specific document
 """
 
-from datetime import datetime, timezone
 import json
 import logging
 import os
-import urllib.parse
+from datetime import datetime, timezone
 from typing import Any, Dict
+
 import boto3
-from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -22,6 +21,7 @@ logger.setLevel(logging.INFO)
 DYNAMODB_TABLE_NAME = os.environ.get("DYNAMODB_TABLE_NAME", "DocumentMetadataTable")
 S3_BUCKET_NAME = os.environ.get("DOCUMENT_BUCKET_NAME", "")
 URL_EXPIRATION_SECONDS = int(os.environ.get("URL_EXPIRATION_SECONDS", "900"))
+ALLOWED_CONTENT_TYPES = {"application/pdf", "image/png", "image/jpeg", "image/tiff"}
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(DYNAMODB_TABLE_NAME)
@@ -61,7 +61,7 @@ def handle_list_documents() -> Dict[str, Any]:
         return _respond(200, {"documents": items, "count": len(items)})
     except Exception as e:
         logger.error(f"Failed to scan DynamoDB: {e}")
-        return _respond(500, {"error": f"Failed to retrieve documents: {str(e)}"})
+        return _respond(500, {"error": "Failed to retrieve documents"})
 
 
 def handle_get_document(doc_id: str) -> Dict[str, Any]:
@@ -74,7 +74,7 @@ def handle_get_document(doc_id: str) -> Dict[str, Any]:
         return _respond(200, {"document": item})
     except Exception as e:
         logger.error(f"Failed to get item {doc_id}: {e}")
-        return _respond(500, {"error": str(e)})
+        return _respond(500, {"error": "Failed to get document"})
 
 
 def handle_generate_upload_url(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -88,6 +88,8 @@ def handle_generate_upload_url(body: Dict[str, Any]) -> Dict[str, Any]:
 
     clean_filename = os.path.basename(filename).replace(" ", "_")
     content_type = body.get("content_type", "application/pdf")
+    if content_type not in ALLOWED_CONTENT_TYPES:
+        return _respond(400, {"error": f"content_type must be one of {sorted(ALLOWED_CONTENT_TYPES)}"})
     s3_key = f"uploads/{clean_filename}"
     doc_id = clean_filename
     now = _now_iso()
@@ -130,12 +132,12 @@ def handle_generate_upload_url(body: Dict[str, Any]) -> Dict[str, Any]:
         )
     except Exception as e:
         logger.error(f"Failed to generate presigned URL: {e}")
-        return _respond(500, {"error": f"Could not generate upload URL: {str(e)}"})
+        return _respond(500, {"error": "Could not generate upload URL"})
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Route document API requests."""
-    logger.info(f"Document API invoked: {json.dumps(event, default=str)}")
+    logger.info(f"Document API invoked: {event.get('routeKey') or event.get('rawPath')}")
 
     http_method = (
         event.get("httpMethod")
@@ -146,7 +148,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     if http_method == "OPTIONS":
         return _respond(200, {"message": "CORS preflight OK"})
 
-    path = event.get("path") or event.get("rawPath") or ""
 
     if http_method == "GET":
         path_parameters = event.get("pathParameters") or {}

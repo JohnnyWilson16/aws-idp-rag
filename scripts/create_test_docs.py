@@ -8,6 +8,7 @@ Creates:
 """
 
 import os
+
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -364,7 +365,8 @@ def create_cloud_services_invoice(output_path: str):
 
 
 if __name__ == "__main__":
-    os.makedirs("/Users/wilson/aws-idp-rag/samples", exist_ok=True)
-    create_master_service_agreement("/Users/wilson/aws-idp-rag/samples/master_service_agreement.pdf")
-    create_cloud_services_invoice("/Users/wilson/aws-idp-rag/samples/cloud_services_invoice.pdf")
+    samples = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "samples")
+    os.makedirs(samples, exist_ok=True)
+    create_master_service_agreement(os.path.join(samples, "master_service_agreement.pdf"))
+    create_cloud_services_invoice(os.path.join(samples, "cloud_services_invoice.pdf"))
     print("All sample business documents created successfully!")
