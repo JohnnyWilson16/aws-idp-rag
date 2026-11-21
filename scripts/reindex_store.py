@@ -53,8 +53,11 @@ def main() -> None:
         if table:
             table.update_item(
                 Key={"DocumentId": payload.get("document_id", doc_name)},
-                UpdateExpression="SET chunk_count = :c, vector_store_s3_key = :k",
-                ExpressionAttributeValues={":c": len(chunks), ":k": STORE_S3_KEY},
+                UpdateExpression=(
+                    "SET #st = :s, stage = :g, chunk_count = :c, vector_store_s3_key = :k REMOVE error_message"
+                ),
+                ExpressionAttributeNames={"#st": "status"},
+                ExpressionAttributeValues={":s": "COMPLETED", ":g": "INDEXED", ":c": len(chunks), ":k": STORE_S3_KEY},
             )
         print(f"  {doc_name}: {len(chunks)} chunks")
 

@@ -383,6 +383,12 @@ Resources:
           StartProcessing:
             Type: Task
             Resource: !GetAtt IdpPipelineFunction.Arn
+            Retry:
+              - ErrorEquals: [Lambda.TooManyRequestsException, Lambda.ServiceException, Lambda.SdkClientException]
+                IntervalSeconds: 2
+                BackoffRate: 2
+                MaxAttempts: 6
+                JitterStrategy: FULL
             Parameters:
               action: start
               s3_bucket.$: "$.detail.bucket.name"
@@ -402,6 +408,12 @@ Resources:
           CheckJobStatus:
             Type: Task
             Resource: !GetAtt IdpPipelineFunction.Arn
+            Retry:
+              - ErrorEquals: [Lambda.TooManyRequestsException, Lambda.ServiceException, Lambda.SdkClientException]
+                IntervalSeconds: 2
+                BackoffRate: 2
+                MaxAttempts: 6
+                JitterStrategy: FULL
             Parameters:
               action: check_status
               job_id.$: "$.job_id"
@@ -430,6 +442,12 @@ Resources:
           ProcessAndIndex:
             Type: Task
             Resource: !GetAtt IdpPipelineFunction.Arn
+            Retry:
+              - ErrorEquals: [Lambda.TooManyRequestsException, Lambda.ServiceException, Lambda.SdkClientException]
+                IntervalSeconds: 2
+                BackoffRate: 2
+                MaxAttempts: 6
+                JitterStrategy: FULL
             Parameters:
               action: process_and_index
               job_id.$: "$.job_id"
@@ -447,6 +465,12 @@ Resources:
           HandleFailure:
             Type: Task
             Resource: !GetAtt IdpPipelineFunction.Arn
+            Retry:
+              - ErrorEquals: [Lambda.TooManyRequestsException, Lambda.ServiceException, Lambda.SdkClientException]
+                IntervalSeconds: 2
+                BackoffRate: 2
+                MaxAttempts: 6
+                JitterStrategy: FULL
             Parameters:
               action: handle_failure
               execution_input.$: "$"
